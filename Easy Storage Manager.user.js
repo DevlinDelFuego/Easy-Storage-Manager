@@ -7,6 +7,7 @@
 // @match        *://*.waze.com/*editor*
 // @exclude      *://*.waze.com/user/editor*
 // @require      https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @license      CC-BY-4.0
 // ==/UserScript==
 
 (function () {
