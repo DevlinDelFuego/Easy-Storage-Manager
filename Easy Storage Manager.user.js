@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Easy Storage Manager
-// @namespace    DevlinDelFuego
+// @namespace    https://greasyfork.org/en/scripts/466806-easy-storage-manager
 // @author       DevlinDelFuego
 // @version      1.0
 // @description  Easy Storage Manager is a handy script that allows you to easily export and import local storage data for WME.
