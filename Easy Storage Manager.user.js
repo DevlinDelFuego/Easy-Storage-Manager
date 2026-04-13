@@ -1,20 +1,20 @@
 // ==UserScript==
-// @name         Easy Storage Manager
+// @name         WME Easy Storage Manager
 // @namespace    https://greasyfork.org/en/scripts/466806-easy-storage-manager
-// @author       DevlinDelFuego, Gentleman_Hiwi
-// @version      2025.12.26
+// @author       Hiwi234, DevlinDelFuego
+// @version      2026.04.04
 // @description  Easy Storage Manager is a handy script that allows you to easily export and import local storage data for WME.
 // @match        *://*.waze.com/*editor*
 // @exclude      *://*.waze.com/user/editor*
 // @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
 // @connect      api.dropboxapi.com
 // @connect      content.dropboxapi.com
+// @connect      www.googleapis.com
+// @connect      oauth2.googleapis.com
+// @connect      accounts.google.com
 // @require      https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
 // @license      GPLv3
-// @run-at       document-start
-// @downloadURL https://update.greasyfork.org/scripts/466806/Easy%20Storage%20Manager.user.js
-// @updateURL https://update.greasyfork.org/scripts/466806/Easy%20Storage%20Manager.meta.js
+// @run-at      document-start
 // ==/UserScript==
 
 (function () {
@@ -25,25 +25,24 @@
     warn: (...args) => console.warn('[ESM]', ...args),
     error: (...args) => console.error('[ESM]', ...args)
   };
-
-  const currentWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-
-  currentWindow.addEventListener('error', (e) => {
+  window.addEventListener('error', (e) => {
     try { sessionStorage.setItem('ESM_DIAG_LAST_ERROR', `${e.message} at ${e.filename}:${e.lineno}`); } catch (err) {}
     ESM_DIAG.error('Unhandled error:', e.message);
   });
-  currentWindow.addEventListener('unhandledrejection', (e) => {
+  window.addEventListener('unhandledrejection', (e) => {
     try { sessionStorage.setItem('ESM_DIAG_LAST_REJECTION', String(e.reason)); } catch (err) {}
     ESM_DIAG.error('Unhandled rejection:', e.reason);
   });
-
-  // Compact UI styles
+  // Compact UI styles to avoid blowing up the layout
   (function injectCompactStyles(){
     const css = `
+      /* Compact buttons across all ESM variants */
       #esm-import, #esm-export,
       #esm-cloud-backup, #esm-cloud-restore,
+      #esm-gdrive-backup, #esm-gdrive-restore,
       #esm-import-btn, #esm-export-btn,
-      #esm-drive-backup-btn, #esm-drive-restore-btn {
+      #esm-drive-backup-btn, #esm-drive-restore-btn,
+      #esm-gdrive-backup-btn, #esm-gdrive-restore-btn {
         padding: 6px 10px !important;
         font-size: 12px !important;
         width: 100% !important;
@@ -55,19 +54,21 @@
         box-sizing: border-box !important;
         margin: 0 !important;
       }
+      /* Row containers: use CSS Grid for perfect equality with 2 equal columns */
       #esm-tab > div, #easy-storage-manager-tab > div {
         display: grid !important;
         width: 100% !important;
-        grid-template-columns: 1fr 1fr 1fr 1fr !important;
+        grid-template-columns: 1fr 1fr !important;
         gap: 8px !important;
         align-items: stretch !important;
         box-sizing: border-box !important;
       }
+      /* Fallback panel button container - also 3 equal columns */
       #esm-fallback-panel .btnRow,
       #esm-fallback-panel > div[style*="display: flex"] {
         display: grid !important;
         width: 100% !important;
-        grid-template-columns: 1fr 1fr 1fr 1fr !important;
+        grid-template-columns: 1fr 1fr 1fr !important;
         gap: 8px !important;
         align-items: stretch !important;
         box-sizing: border-box !important;
@@ -102,12 +103,18 @@
     } catch (_) {}
   })();
 
-    let importedData;
-    let applyButton;
-    let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : '2025.12.26';
-    const updateMessage = "<b>Changelog</b><br><br> - Full backup export/import now includes localStorage, sessionStorage, cookies, and IndexedDB. <br> - You can select which items to restore across all storage types and DB records. <br> - The page will refresh after importing to apply changes. <br> - Added Dropbox cloud backup and restore functionality. <br> - Integrated with WME SDK for sidebar tab registration. <br><br>";
+    let importedData; // Imported JSON data
+    let applyButton; // Apply button element
+    let autoSaveInterval = null;
+    let autoSaveEnabled = false;
+    const AUTO_SAVE_ENABLED_KEY = 'ESM_AUTO_SAVE_ENABLED';
+    const AUTO_SAVE_INTERVAL_KEY = 'ESM_AUTO_SAVE_INTERVAL';
+    const AUTO_SAVE_TARGET_KEY = 'ESM_AUTO_SAVE_TARGET';
+    const AUTO_SAVE_MAX_BACKUPS_KEY = 'ESM_AUTO_SAVE_MAX_BACKUPS';
+    let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : 'dev-local';
+    const updateMessage = "<b>Changelog</b><br><br> - Full backup export/import now includes localStorage, sessionStorage, cookies, and IndexedDB. <br> - You can select which items to restore across all storage types and DB records. <br> - The page will refresh after importing to apply changes. <br> - Added Dropbox cloud backup and restore functionality. <br> - Added Google Drive cloud backup and restore functionality. <br><br>";
     const REAPPLY_STASH_KEY = 'ESM_POST_RELOAD';
-
+    // Sprachunterstützung (DE/EN) für UI-Texte
     const ESM_LANG = ((navigator.language || 'en').toLowerCase().startsWith('de')) ? 'de' : 'en';
     const ESM_I18N = {
       de: {
@@ -117,19 +124,95 @@
         howTo: 'So aktivierst du die Online-Cloud:',
         step1: 'Bei Dropbox anmelden.',
         step2: 'App erstellen (kostenlos):',
-        step3: 'Stel de volgende machtigingen in: bestanden.metadata.lezen, bestanden.inhoud.schrijven, bestanden.inhoud.lezen',
-        step4: 'In deiner App einen Generated access token erzeugen.',
-        step5: 'Token unten eingeben und speichern.',
+        step3: 'In deiner App einen Generated access token erzeugen.',
+        step4: 'Token unten eingeben und speichern.',
         genTokenLabel: 'Generated access token:',
         saveTokenBtn: 'Token speichern',
         clearTokenBtn: 'Abmelden',
         statusEnterToken: 'Bitte Token eingeben.',
         statusSavedValidated: 'Token gespeichert und validiert. Dropbox ist bereit.',
         statusSignedOut: 'Abgemeldet. Bitte neuen Token eingeben.',
-        cloudBackup: '☁️ Cloud Sichern',
-        cloudRestore: '☁️ Wiederherstellen',
+        cloudBackup: '☁️ Dropbox Sichern',
+        cloudRestore: '☁️ Dropbox Laden',
         cloudBackupTitle: '☁️ Backup in Dropbox sichern',
         cloudRestoreTitle: '☁️ Aus Dropbox wiederherstellen',
+        gdriveBackup: '📁 Google Sichern',
+        gdriveRestore: '📁 Google Laden',
+        gdriveBackupTitle: '📁 Backup in Google Drive sichern',
+        gdriveRestoreTitle: '📁 Aus Google Drive wiederherstellen',
+        gdrivePanelTitle: 'Google Drive – Verbindung',
+        gdriveHowTo: 'So aktivierst du Google Drive:',
+        gdriveStep1: 'Google Cloud Console öffnen.',
+        gdriveStep2: 'Projekt erstellen und Google Drive API aktivieren.',
+        gdriveStep3: 'OAuth 2.0 Client-ID erstellen (Web-App).',
+        gdriveStep4: 'API-Key unten eingeben und speichern.',
+        gdriveTokenLabel: 'Google Drive API Key / Access Token:',
+        gdriveSaveTokenBtn: 'Token speichern',
+        gdriveClearTokenBtn: 'Abmelden',
+        gdriveStatusEnterToken: 'Bitte Google Drive Token eingeben.',
+        gdriveStatusSaved: 'Token gespeichert. Google Drive ist bereit.',
+        gdriveStatusSignedOut: 'Abgemeldet. Bitte neuen Token eingeben.',
+        gdriveSaveSuccess: '✅ Backup erfolgreich in Google Drive gespeichert!',
+        gdriveSaveFailed: '❌ Google Drive Backup fehlgeschlagen:',
+        gdriveNoBackups: '❌ Keine Backup-Dateien in Google Drive gefunden.',
+        gdriveLoadSuccess: '✅ Google Drive Backup erfolgreich geladen!',
+        gdriveRestoreFailed: '❌ Google Drive Wiederherstellung fehlgeschlagen:',
+        gdriveExportUnavailable: 'Google Drive Backup-Funktion nicht verfügbar',
+        gdriveImportUnavailable: 'Google Drive Wiederherstellungs-Funktion nicht verfügbar'
+      },
+      en: {
+        panelTitle: 'Cloud Backup (Dropbox) – Guide',
+        show: 'Show',
+        hide: 'Hide',
+        howTo: 'How to enable cloud backup:',
+        step1: 'Sign in to Dropbox.',
+        step2: 'Create an app (free):',
+        step3: 'Generate a personal access token in your app.',
+        step4: 'Enter the token below and save it.',
+        genTokenLabel: 'Generated access token:',
+        saveTokenBtn: 'Save Token',
+        clearTokenBtn: 'Sign out',
+        statusEnterToken: 'Please enter a token.',
+        statusSavedValidated: 'Token saved and validated. Dropbox is ready.',
+        statusSignedOut: 'Signed out. Please enter a new token.',
+        cloudBackup: '☁️ Dropbox Backup',
+        cloudRestore: '☁️ Dropbox Restore',
+        cloudBackupTitle: '☁️ Save backup to Dropbox',
+        cloudRestoreTitle: '☁️ Restore from Dropbox',
+        gdriveBackup: '📁 Google Backup',
+        gdriveRestore: '📁 Google Restore',
+        gdriveBackupTitle: '📁 Save backup to Google Drive',
+        gdriveRestoreTitle: '📁 Restore from Google Drive',
+        gdrivePanelTitle: 'Google Drive – Connection',
+        gdriveHowTo: 'How to enable Google Drive backup:',
+        gdriveStep1: 'Open Google Cloud Console.',
+        gdriveStep2: 'Create a project and enable Google Drive API.',
+        gdriveStep3: 'Create an OAuth 2.0 Client ID (Web App).',
+        gdriveStep4: 'Enter the token below and save it.',
+        gdriveTokenLabel: 'Google Drive API Key / Access Token:',
+        gdriveSaveTokenBtn: 'Save Token',
+        gdriveClearTokenBtn: 'Sign out',
+        gdriveStatusEnterToken: 'Please enter a Google Drive token.',
+        gdriveStatusSaved: 'Token saved. Google Drive is ready.',
+        gdriveStatusSignedOut: 'Signed out. Please enter a new token.',
+        gdriveSaveSuccess: '✅ Backup saved to Google Drive successfully!',
+        gdriveSaveFailed: '❌ Google Drive backup failed:',
+        gdriveNoBackups: '❌ No backup files found in Google Drive.',
+        gdriveLoadSuccess: '✅ Google Drive backup loaded successfully!',
+        gdriveRestoreFailed: '❌ Google Drive restore failed:',
+        gdriveExportUnavailable: 'Google Drive backup function not available',
+        gdriveImportUnavailable: 'Google Drive restore function not available'
+      }
+    };
+    function t(key) {
+      const langVal = (ESM_I18N[ESM_LANG] && ESM_I18N[ESM_LANG][key]) || null;
+      const enVal = (ESM_I18N.en && ESM_I18N.en[key]) || null;
+      const deVal = (ESM_I18N.de && ESM_I18N.de[key]) || null;
+      return langVal || enVal || deVal || key;
+    }
+    // Extend language maps with additional UI texts for Import/Export & Drive
+    try {
+      Object.assign(ESM_I18N.de, {
         importExportDesc: 'Importiere eine Backup-JSON-Datei oder exportiere ein vollständiges Backup (localStorage, sessionStorage, Cookies, IndexedDB).',
         importBackup: '♻️ Wiederherstellen',
         exportBackup: '💾 Lokal Speichern',
@@ -148,44 +231,21 @@
         apply: 'Anwenden',
         scriptTitle: 'Easy Storage Manager',
         fallbackDesc: 'Fallback-Panel aktiv. Importiere/Exportiere Backups und wähle Schlüssel zur Wiederherstellung.',
-        dropboxSaveSuccessPrefix: '✅ Backup erfolgreich in Dropbox gespeichert!',
-        dropboxSaveFailedPrefix: '❌ Dropbox Backup fehlgeschlagen:',
-        dropboxNoBackups: '❌ Keine Backup-Dateien in Dropbox gefunden.',
-        invalidSelection: '❌ Ungültige Auswahl.',
-        foreignBackupHint: 'Hinweis: Das Backup stammt von einer anderen Quelle. Aus Sicherheitsgründen werden Cookies und Session Storage standardmäßig nicht importiert.',
-        dropboxLoadSuccessPrefix: '✅ Dropbox Backup erfolgreich geladen!',
-        foundEntriesLabel: 'Gefundene Einträge:',
-        invalidJson: '❌ Backup-Datei konnte nicht gelesen werden: Ungültiges JSON-Format.',
-        dropboxRestoreFailedPrefix: '❌ Dropbox Wiederherstellung fehlgeschlagen:',
-        fileReadSuccess: 'Datei erfolgreich gelesen',
-        fileReadError: 'Fehler beim Lesen der Datei. Bitte erneut versuchen.',
-        noKeysSelected: 'Keine Schlüssel ausgewählt. Nichts zu importieren.',
-        fileLabel: 'Datei:',
-        pathLabel: 'Pfad:',
-        sizeLabel: 'Größe:',
-        kb: 'KB',
-        restorePrompt: 'Welche Datei möchten Sie wiederherstellen?'
-      },
-      en: {
-        panelTitle: 'Cloud Backup (Dropbox) – Guide',
-        show: 'Show',
-        hide: 'Hide',
-        howTo: 'How to enable cloud backup:',
-        step1: 'Sign in to Dropbox.',
-        step2: 'Create an app (free):',
-        step3: 'set permissions: files.metadata.read, files.content.write, files.content.read',
-        step4: 'Generate a personal access token in your app.',
-        step5: 'Enter the token below and save it.',
-        genTokenLabel: 'Generated access token:',
-        saveTokenBtn: 'Save Token',
-        clearTokenBtn: 'Sign out',
-        statusEnterToken: 'Please enter a token.',
-        statusSavedValidated: 'Token saved and validated. Dropbox is ready.',
-        statusSignedOut: 'Signed out. Please enter a new token.',
-        cloudBackup: '☁️ Cloud Backup',
-        cloudRestore: '☁️ Restore',
-        cloudBackupTitle: '☁️ Save backup to Dropbox',
-        cloudRestoreTitle: '☁️ Restore from Dropbox',
+        autoSaveLabel: '⏱️ Auto Save',
+        autoSaveEnable: 'Auto Save aktivieren',
+        autoSaveInterval: 'Intervall:',
+        autoSaveTarget: 'Ziel:',
+        autoSaveTargetLocal: 'Lokal (Download)',
+        autoSaveTargetDropbox: 'Dropbox',
+        autoSaveTargetGdrive: 'Google Drive',
+        autoSaveRunning: 'Auto Save läuft...',
+        autoSaveDone: '✅ Auto Save abgeschlossen.',
+        autoSaveFailed: '❌ Auto Save fehlgeschlagen:',
+        autoSaveMaxBackups: 'Backups:',
+        autoSaveMaxBackupsHint1: '1 = überschreiben',
+        autoSaveMaxBackupsHint10: '10 = rotierend'
+      });
+      Object.assign(ESM_I18N.en, {
         importExportDesc: 'Import a backup JSON file or export a full backup (localStorage, sessionStorage, cookies, IndexedDB).',
         importBackup: '♻️ Restore',
         exportBackup: '💾 Save Local',
@@ -204,6 +264,42 @@
         apply: 'Apply',
         scriptTitle: 'Easy Storage Manager',
         fallbackDesc: 'Fallback panel active. Import/export backups and choose keys to restore.',
+        autoSaveLabel: '⏱️ Auto Save',
+        autoSaveEnable: 'Enable Auto Save',
+        autoSaveInterval: 'Interval:',
+        autoSaveTarget: 'Target:',
+        autoSaveTargetLocal: 'Local (Download)',
+        autoSaveTargetDropbox: 'Dropbox',
+        autoSaveTargetGdrive: 'Google Drive',
+        autoSaveRunning: 'Auto Save running...',
+        autoSaveDone: '✅ Auto Save completed.',
+        autoSaveFailed: '❌ Auto Save failed:',
+        autoSaveMaxBackups: 'Backups:',
+        autoSaveMaxBackupsHint1: '1 = overwrite',
+        autoSaveMaxBackupsHint10: '10 = rotating'
+      });
+    } catch (_) {}
+    // Zusätzliche Texte für vollständige UI-Übersetzung (Alerts/Labels)
+    try {
+      Object.assign(ESM_I18N.de, {
+        dropboxSaveSuccessPrefix: '✅ Backup erfolgreich in Dropbox gespeichert!',
+        dropboxSaveFailedPrefix: '❌ Dropbox Backup fehlgeschlagen:',
+        dropboxNoBackups: '❌ Keine Backup-Dateien in Dropbox gefunden.',
+        invalidSelection: '❌ Ungültige Auswahl.',
+        foreignBackupHint: 'Hinweis: Das Backup stammt von einer anderen Quelle. Aus Sicherheitsgründen werden Cookies und Session Storage standardmäßig nicht importiert.',
+        dropboxLoadSuccessPrefix: '✅ Dropbox Backup erfolgreich geladen!',
+        foundEntriesLabel: 'Gefundene Einträge:',
+        invalidJson: '❌ Backup-Datei konnte nicht gelesen werden: Ungültiges JSON-Format.',
+        dropboxRestoreFailedPrefix: '❌ Dropbox Wiederherstellung fehlgeschlagen:',
+        fileReadSuccess: 'Datei erfolgreich gelesen',
+        fileReadError: 'Fehler beim Lesen der Datei. Bitte erneut versuchen.',
+        noKeysSelected: 'Keine Schlüssel ausgewählt. Nichts zu importieren.',
+        fileLabel: 'Datei:',
+        pathLabel: 'Pfad:',
+        sizeLabel: 'Größe:',
+        kb: 'KB'
+      });
+      Object.assign(ESM_I18N.en, {
         dropboxSaveSuccessPrefix: '✅ Backup saved to Dropbox successfully!',
         dropboxSaveFailedPrefix: '❌ Dropbox backup failed:',
         dropboxNoBackups: '❌ No backup files found in Dropbox.',
@@ -219,21 +315,26 @@
         fileLabel: 'File:',
         pathLabel: 'Path:',
         sizeLabel: 'Size:',
-        kb: 'KB',
+        kb: 'KB'
+      });
+    } catch (_) {}
+    try {
+      Object.assign(ESM_I18N.de, {
+        restorePrompt: 'Welche Datei möchten Sie wiederherstellen?'
+      });
+      Object.assign(ESM_I18N.en, {
         restorePrompt: 'Which file would you like to restore?'
-      }
-    };
+      });
+    } catch (_) {}
 
-    function t(key) {
-      const langVal = (ESM_I18N[ESM_LANG] && ESM_I18N[ESM_LANG][key]) || null;
-      const enVal = (ESM_I18N.en && ESM_I18N.en[key]) || null;
-      return langVal || enVal || key;
-    }
-
+    // Dropbox API Configuration
     const DROPBOX_CONFIG = {
-      APP_KEY: 'vrc8owxjcgnbczs',
-      APP_SECRET: 'ywpvq6qu1ngxp81',
+      APP_KEY: '9fxl4soww5di6qt',
+      APP_SECRET: '46inexcd3evrqik',
       ACCESS_TOKEN: null,
+      REDIRECT_URI: 'http://localhost:8080/esm_dropbox_oauth.html',
+      // Use same-origin Waze Dropbox endpoint to satisfy CSP
+      PROXY_BASE_URL: '/dropbox',
       API_BASE_URL: 'https://api.dropboxapi.com/2',
       CONTENT_API_URL: 'https://content.dropboxapi.com/2'
     };
@@ -241,21 +342,30 @@
     let dropboxAuth = null;
     const DROPBOX_TOKEN_KEY = 'ESM_DROPBOX_TOKEN';
     const DROPBOX_ACCOUNT_CACHE_KEY = 'ESM_DROPBOX_ACCOUNT';
+    const DROPBOX_REFRESH_TOKEN_KEY = 'ESM_DROPBOX_REFRESH_TOKEN';
+    const DROPBOX_TOKEN_EXPIRES_KEY = 'ESM_DROPBOX_TOKEN_EXPIRES';
+const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
+// Hook alerts to display bilingual messages for known keys
+(function(){
+  const origAlert = window.alert;
+  const map = {
+    'Import function not available': t('importFunctionUnavailable'),
+    'Export function not available': t('exportFunctionUnavailable'),
+    'Dropbox Backup-Funktion nicht verfügbar': t('dropboxExportUnavailable'),
+    'Dropbox Wiederherstellungs-Funktion nicht verfügbar': t('dropboxImportUnavailable'),
+  };
+  window.alert = function(msg){
+    const key = String(msg);
+    const repl = map[key] || key;
+    return origAlert(repl);
+  };
+})();
 
-    (function(){
-      const origAlert = currentWindow.alert;
-      const map = {
-        'Import function not available': t('importFunctionUnavailable'),
-        'Export function not available': t('exportFunctionUnavailable'),
-        'Dropbox Backup-Funktion nicht verfügbar': t('dropboxExportUnavailable'),
-        'Dropbox Wiederherstellungs-Funktion nicht verfügbar': t('dropboxImportUnavailable'),
-      };
-      currentWindow.alert = function(msg){
-        const key = String(msg);
-        const repl = map[key] || key;
-        return origAlert(repl);
-      };
-    })();
+    function getRedirectUri() {
+      const saved = localStorage.getItem(DROPBOX_REDIRECT_URI_KEY);
+      if (saved && typeof saved === 'string' && saved.trim()) return saved.trim();
+      return DROPBOX_CONFIG.REDIRECT_URI;
+    }
 
     function setDropboxToken(token) {
       try {
@@ -270,6 +380,8 @@
     function clearDropboxToken() {
       try {
         localStorage.removeItem(DROPBOX_TOKEN_KEY);
+        localStorage.removeItem(DROPBOX_REFRESH_TOKEN_KEY);
+        localStorage.removeItem(DROPBOX_TOKEN_EXPIRES_KEY);
         dropboxAuth = null;
         sessionStorage.removeItem(DROPBOX_ACCOUNT_CACHE_KEY);
         ESM_DIAG.log('Dropbox-Token gelöscht.');
@@ -282,24 +394,28 @@
       const hint = 'Bitte persönliches Dropbox Access Token eingeben (Bearer Token).\n' +
         'Anleitung: Öffne https://www.dropbox.com/developers/apps, wähle deine App,\n' +
         'erzeuge ein Access Token und füge es hier ein.';
-      const token = currentWindow.prompt(hint);
+      const token = prompt(hint);
       if (!token) throw new Error('Kein Dropbox-Token eingegeben');
       setDropboxToken(token.trim());
+      // Validierung
       await getDropboxAccount(token.trim());
       return token.trim();
     }
 
     async function getDropboxAccount(accessToken) {
+      // Cache lesen
       try {
         const cached = sessionStorage.getItem(DROPBOX_ACCOUNT_CACHE_KEY);
         if (cached) return JSON.parse(cached);
       } catch (_) {}
       if (typeof GM_xmlhttpRequest !== 'function') {
+        // Ohne GM können wir den Account nicht bequem validieren; Return minimal
         return { account_id: 'unknown', email: 'unknown' };
       }
       const res = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL}/users/get_current_account`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${accessToken}` },
+        // Body muss leer sein
       });
       if (res.status < 200 || res.status >= 300) {
         throw new Error(`Dropbox-Token ungültig (${res.status})`);
@@ -310,9 +426,167 @@
       return info;
     }
 
+    // Helfer global verfügbar machen
+    try {
+      window.ESM_setDropboxToken = setDropboxToken;
+      window.ESM_clearDropboxToken = clearDropboxToken;
+      window.ESM_promptDropboxToken = promptForDropboxToken;
+      window.ESM_setDropboxRedirectUri = function (url) {
+        try {
+          if (typeof url !== 'string' || !url.trim()) throw new Error('Ungültige URL');
+          const u = url.trim();
+          localStorage.setItem(DROPBOX_REDIRECT_URI_KEY, u);
+          DROPBOX_CONFIG.REDIRECT_URI = u; // live update
+          ESM_DIAG.log('Dropbox Redirect-URI gesetzt:', u);
+        } catch (e) {
+          ESM_DIAG.error('Konnte Redirect-URI nicht setzen:', e);
+        }
+      };
+      window.ESM_getDropboxRedirectUri = function () { return getRedirectUri(); };
+    } catch (_) {}
+
+    // ===== OAuth 2.0 (PKCE) Hilfsfunktionen =====
+    function base64urlFromBytes(bytes) {
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    }
+    function generateCodeVerifier() {
+      const bytes = new Uint8Array(64);
+      crypto.getRandomValues(bytes);
+      return base64urlFromBytes(bytes);
+    }
+    async function sha256Base64Url(input) {
+      const data = new TextEncoder().encode(input);
+      const hash = await crypto.subtle.digest('SHA-256', data);
+      return base64urlFromBytes(new Uint8Array(hash));
+    }
+    function saveTokenResponse(token) {
+      try {
+        if (token.access_token) localStorage.setItem(DROPBOX_TOKEN_KEY, token.access_token);
+        if (token.refresh_token) localStorage.setItem(DROPBOX_REFRESH_TOKEN_KEY, token.refresh_token);
+        const expiresAt = token.expires_in ? (Date.now() + (token.expires_in * 1000)) : 0;
+        localStorage.setItem(DROPBOX_TOKEN_EXPIRES_KEY, String(expiresAt));
+        dropboxAuth = token.access_token || null;
+      } catch (e) {
+        ESM_DIAG.warn('Konnte Token-Antwort nicht speichern:', e);
+      }
+    }
+    async function exchangeCodeForToken(code, verifier) {
+      const body = new URLSearchParams({
+        code,
+        grant_type: 'authorization_code',
+        client_id: DROPBOX_CONFIG.APP_KEY,
+        code_verifier: verifier,
+        redirect_uri: getRedirectUri()
+      }).toString();
+      const res = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL.replace('/2','')}/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`Token-Austausch fehlgeschlagen (${res.status}): ${res.responseText || ''}`);
+      }
+      let json; try { json = JSON.parse(res.responseText); } catch (_) { json = {}; }
+      saveTokenResponse(json);
+      return json;
+    }
+    async function refreshAccessToken() {
+      const refreshToken = localStorage.getItem(DROPBOX_REFRESH_TOKEN_KEY);
+      if (!refreshToken) throw new Error('Kein Refresh-Token vorhanden');
+      const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: DROPBOX_CONFIG.APP_KEY
+      }).toString();
+      const res = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL.replace('/2','')}/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body
+      });
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`Token-Refresh fehlgeschlagen (${res.status}): ${res.responseText || ''}`);
+      }
+      let json; try { json = JSON.parse(res.responseText); } catch (_) { json = {}; }
+      saveTokenResponse(json);
+      return json;
+    }
+    async function ensureDropboxAccessToken() {
+      const token = localStorage.getItem(DROPBOX_TOKEN_KEY);
+      const exp = parseInt(localStorage.getItem(DROPBOX_TOKEN_EXPIRES_KEY) || '0', 10);
+      if (token && exp && (Date.now() < (exp - 60_000))) {
+        dropboxAuth = token;
+        return token;
+      }
+      if (localStorage.getItem(DROPBOX_REFRESH_TOKEN_KEY)) {
+        const refreshed = await refreshAccessToken();
+        return refreshed.access_token;
+      }
+      return null;
+    }
+    async function oauthDropboxPKCE() {
+      const verifier = generateCodeVerifier();
+      const challenge = await sha256Base64Url(verifier);
+      const state = Math.random().toString(36).slice(2);
+      try { sessionStorage.setItem('ESM_OAUTH_VERIFIER', verifier); sessionStorage.setItem('ESM_OAUTH_STATE', state); } catch (_) {}
+      const redirectUri = getRedirectUri();
+      // Warnung ausgeben, falls die Redirect-URI offensichtlich nicht produktionsfähig ist
+      try {
+        const u = new URL(redirectUri);
+        if (u.protocol !== 'https:' && u.hostname !== 'localhost') {
+          ESM_DIAG.warn('Redirect-URI ist nicht HTTPS. Dropbox verlangt im Live-Betrieb HTTPS.');
+        }
+      } catch (e) {
+        ESM_DIAG.warn('Ungültige Redirect-URI-Konfiguration:', redirectUri);
+      }
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: DROPBOX_CONFIG.APP_KEY,
+        redirect_uri: redirectUri,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+        token_access_type: 'offline',
+        state
+      }).toString();
+      const authUrl = `https://www.dropbox.com/oauth2/authorize?${params}`;
+      const w = window.open(authUrl, 'esm_dropbox_oauth', 'width=600,height=700');
+      if (!w) throw new Error('Konnte OAuth-Fenster nicht öffnen');
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          window.removeEventListener('message', onMsg);
+          reject(new Error('OAuth Zeitüberschreitung'));
+        }, 180_000);
+        function onMsg(e) {
+          try {
+            const data = e.data || {};
+            if (data && data.type === 'ESM_DROPBOX_OAUTH_CODE') {
+              window.removeEventListener('message', onMsg);
+              clearTimeout(timer);
+              const ver = sessionStorage.getItem('ESM_OAUTH_VERIFIER') || verifier;
+              const st = sessionStorage.getItem('ESM_OAUTH_STATE');
+              if (st && data.state && st !== data.state) {
+                reject(new Error('Ungültiger OAuth state'));
+                return;
+              }
+              exchangeCodeForToken(data.code, ver).then(resolve).catch(reject);
+            }
+          } catch (err) {
+            // ignore
+          }
+        }
+        window.addEventListener('message', onMsg);
+      });
+    }
+    try { window.ESM_startDropboxOAuth = oauthDropboxPKCE; } catch (_) {}
+
+    // Wrapper around GM_xmlhttpRequest to bypass page CSP when available
     function gmFetch(url, opts = {}) {
       const method = opts.method || 'GET';
       const headers = opts.headers || {};
+      // Only include a request body if the caller provided one.
+      // This avoids sending the literal string "null" to endpoints (e.g. Dropbox files/download)
+      // that require an entirely empty request body.
       const hasBody = Object.prototype.hasOwnProperty.call(opts, 'body');
       let body = null;
       if (hasBody) {
@@ -335,7 +609,9 @@
             onerror: (err) => reject(new Error(err && err.error ? err.error : 'GM request failed')),
             ontimeout: () => reject(new Error('GM request timeout'))
           };
-          if (body != null) req.data = body;
+          if (body != null) {
+            req.data = body;
+          }
           GM_xmlhttpRequest(req);
         } catch (e) {
           reject(e);
@@ -343,6 +619,7 @@
       });
     }
 
+    // Get safe, preferably native storage methods from a fresh iframe context (in case other scripts patch the prototype)
     function captureNativeStorage() {
       try {
         const iframe = document.createElement('iframe');
@@ -359,6 +636,7 @@
         iframe.parentNode.removeChild(iframe);
         return methods;
       } catch (e) {
+        // Fallback to current (possibly patched) prototype
         return {
           getItem: Storage.prototype.getItem,
           setItem: Storage.prototype.setItem,
@@ -369,8 +647,12 @@
     }
     const NativeStorage = captureNativeStorage();
 
-    try { reapplyAfterReload(); } catch (_) { }
+    // Early recovery attempt immediately after script start,
+    // so that protected keys are activated before other user scripts, if possible
+    try { reapplyAfterReload(); } catch (_) { /* ignore */ }
 
+    // ===== Einfache Anleitung & Token-Input (UI) für Dropbox Cloud =====
+    // parent: optional Container; wenn gesetzt, wird das Panel inline im Skripte-Tab gerendert
     function injectDropboxHelpPanel(parent) {
       try {
         if (document.getElementById('esm-dropbox-help-panel')) return;
@@ -403,6 +685,7 @@
         } else {
           card.style.boxShadow = 'none';
           card.style.width = '100%';
+          card.style.maxWidth = '100%';
         }
 
         const header = document.createElement('div');
@@ -466,6 +749,7 @@
           document.documentElement.appendChild(wrapper);
         }
 
+        // Prefill input with stored token if available
         const input = content.querySelector('#esm-dropbox-token-input');
         const saveBtn = content.querySelector('#esm-dropbox-token-save');
         const clearBtn = content.querySelector('#esm-dropbox-token-clear');
@@ -485,10 +769,11 @@
           if (!token) { setStatus(t('statusEnterToken'), 'error'); return; }
           try {
             setDropboxToken(token);
+            // optional: validate account
             await getDropboxAccount(token);
             setStatus(t('statusSavedValidated'), 'success');
           } catch (e) {
-            setStatus(`Fehler: ${e && e.message ? e.message : e}`, 'error');
+            setStatus(`Fehler beim Speichern/Validieren: ${e && e.message ? e.message : e}`, 'error');
           }
         });
 
@@ -498,167 +783,914 @@
             input.value = '';
             setStatus(t('statusSignedOut'), '');
           } catch (e) {
-            setStatus(`Fehler: ${e && e.message ? e.message : e}`, 'error');
+            setStatus(`Fehler beim Abmelden: ${e && e.message ? e.message : e}`, 'error');
           }
         });
       } catch (e) {
         ESM_DIAG.warn('Konnte Dropbox-Hilfspanel nicht einfügen:', e);
       }
     }
+    // Hinweis: Die Hilfe wird jetzt im Skripte-Tab inline eingefügt (siehe addScriptTab)
 
+    // Authenticate with Dropbox (ohne OAuth, nur gespeicherter Access-Token)
     async function authenticateDropbox() {
       try {
+        ESM_DIAG.log('Dropbox-Authentifizierung (nur Token) starten...');
+        // Direkt gespeicherten Token verwenden
         const token = (dropboxAuth && String(dropboxAuth).trim()) || localStorage.getItem(DROPBOX_TOKEN_KEY);
         if (token && String(token).trim()) {
           try { await getDropboxAccount(token); } catch (_) {}
           dropboxAuth = String(token).trim();
           return dropboxAuth;
         }
+        // Kein Token vorhanden -> Nutzer um persönlichen Access-Token bitten
         const manual = await promptForDropboxToken();
         dropboxAuth = manual;
         return manual;
       } catch (error) {
+        ESM_DIAG.error('Dropbox-Authentifizierung (Token) fehlgeschlagen:', error);
         throw error;
       }
     }
 
+    // Attempt to attach CSRF headers expected by waze.com endpoints
+    function getCsrfHeaders() {
+      try {
+        const cookies = document.cookie.split(';').map(s => s.trim()).reduce((acc, cur) => {
+          const idx = cur.indexOf('=');
+          if (idx > -1) acc[cur.slice(0, idx)] = decodeURIComponent(cur.slice(idx + 1));
+          return acc;
+        }, {});
+        const token = cookies['XSRF-TOKEN'] || cookies['xsrf-token'] || cookies['_csrf'] || cookies['csrf'] || cookies['csrf_token'] || cookies['X-CSRF-TOKEN'];
+        if (!token) {
+          ESM_DIAG.warn('No CSRF token cookie found for waze.com Dropbox endpoint');
+          return {};
+        }
+        const headers = {
+          'X-XSRF-TOKEN': token,
+          'X-CSRF-TOKEN': token,
+          'X-CSRF-Token': token
+        };
+        ESM_DIAG.log('Attached CSRF headers for waze.com Dropbox endpoint');
+        return headers;
+      } catch (e) {
+        ESM_DIAG.warn('Failed to build CSRF headers:', e);
+        return {};
+      }
+    }
+
+
+    // Export backup to Dropbox
     async function exportToDropbox() {
       try {
+        ESM_DIAG.log('Starting Dropbox backup...');
+
+        // Token ermitteln (kein OAuth)
         const accessToken = await authenticateDropbox();
-        const backup = await generateFullBackup();
-        backup.meta.backupType = 'dropbox';
+
+        // Generate backup data (same as local export)
+        const backup = {
+          meta: {
+            exportedAt: new Date().toISOString(),
+            origin: location.origin,
+            scriptVersion,
+            backupType: 'dropbox'
+          },
+          localStorage: (() => {
+            const out = {};
+            try {
+              const len = window.localStorage.length;
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.localStorage, i);
+                if (k != null) {
+                  out[k] = NativeStorage.getItem.call(window.localStorage, k);
+                }
+              }
+            } catch (e) {
+              Object.keys(window.localStorage).forEach(k => {
+                try { out[k] = window.localStorage.getItem(k); } catch (_) { out[k] = null; }
+              });
+            }
+            return out;
+          })(),
+          sessionStorage: (() => {
+            const out = {};
+            try {
+              const len = window.sessionStorage.length;
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.sessionStorage, i);
+                if (k != null) {
+                  out[k] = NativeStorage.getItem.call(window.sessionStorage, k);
+                }
+              }
+            } catch (e) {
+              Object.keys(window.sessionStorage).forEach(k => {
+                try { out[k] = window.sessionStorage.getItem(k); } catch (_) { out[k] = null; }
+              });
+            }
+            return out;
+          })(),
+          cookies: document.cookie
+            .split(';')
+            .map(c => {
+              const [name, ...rest] = c.trim().split('=');
+              return { name, value: rest.join('=') };
+            })
+            .filter(c => c.name),
+          indexedDB: await backupIndexedDB()
+        };
+
         const backupData = JSON.stringify(backup, null, 2);
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const fileName = `wme_settings_backup_${timestamp}.json`;
         const account = await getDropboxAccount(accessToken);
         const userFolder = `/WME_Backups/${account && account.account_id ? account.account_id : 'unknown'}`;
 
-        const gmRes = await gmFetch(`${DROPBOX_CONFIG.CONTENT_API_URL}/files/upload`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'Authorization': `Bearer ${accessToken}`,
-            'Dropbox-API-Arg': JSON.stringify({
-              path: `${userFolder}/${fileName}`,
-              mode: 'add',
-              autorename: true
-            })
-          },
-          body: backupData
-        });
-        if (gmRes.status < 200 || gmRes.status >= 300) throw new Error(gmRes.responseText);
+        // Upload to Dropbox
+        let result;
+        if (typeof GM_xmlhttpRequest === 'function') {
+          // Use GM_xmlhttpRequest to bypass CSP and talk to Dropbox directly
+          ESM_DIAG.log('Uploading backup to Dropbox via GM_xmlhttpRequest...');
+          const gmRes = await gmFetch(`${DROPBOX_CONFIG.CONTENT_API_URL}/files/upload`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Authorization': `Bearer ${accessToken}`,
+              'Dropbox-API-Arg': JSON.stringify({
+                path: `${userFolder}/${fileName}`,
+                mode: 'add',
+                autorename: true
+              })
+            },
+            body: backupData
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox upload (GM) failed:', err);
+            throw new Error(`Network error during Dropbox upload (GM): ${err.message}`);
+          });
+          if (gmRes.status < 200 || gmRes.status >= 300) {
+            const errorText = gmRes.responseText || 'Unknown error';
+            ESM_DIAG.error('Dropbox upload (GM) failed:', gmRes.status, errorText);
+            throw new Error(`Upload failed: ${gmRes.status} - ${errorText}`);
+          }
+          try {
+            result = JSON.parse(gmRes.responseText);
+          } catch (err) {
+            ESM_DIAG.error('Failed to parse upload response (GM):', err);
+            throw new Error(`Invalid response format from Dropbox upload (GM): ${err.message}`);
+          }
+        } else {
+          // Fallback to same-origin proxy (requires CSP + CSRF compliance in WME)
+          ESM_DIAG.log('Uploading backup to Dropbox via same-origin proxy...');
+          const response = await fetch(`${DROPBOX_CONFIG.PROXY_BASE_URL}/files/upload`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Dropbox-API-Arg': JSON.stringify({
+                path: `${userFolder}/${fileName}`,
+                mode: 'add',
+                autorename: true
+              }),
+              ...getCsrfHeaders()
+            },
+            credentials: 'include',
+            body: backupData
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox upload fetch failed:', err);
+            throw new Error(`Network error during Dropbox upload: ${err.message}`);
+          });
 
-        currentWindow.alert(`${t('dropboxSaveSuccessPrefix')}\n\n${t('fileLabel')} ${fileName}\n${t('sizeLabel')} ${Math.round(backupData.length / 1024)} ${t('kb')}`);
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => 'Unknown error');
+            ESM_DIAG.error('Dropbox upload failed:', response.status, response.statusText, errorText);
+            throw new Error(`Upload failed: ${response.status} ${response.statusText} - ${errorText}`);
+          }
+
+          result = await response.json().catch(err => {
+            ESM_DIAG.error('Failed to parse upload response:', err);
+            throw new Error(`Invalid response format from Dropbox upload: ${err.message}`);
+          });
+        }
+        ESM_DIAG.log('Backup uploaded to Dropbox:', result);
+
+        alert(`${t('dropboxSaveSuccessPrefix')}\n\n${t('fileLabel')} ${fileName}\n${t('pathLabel')} /WME_Backups/${fileName}\n${t('sizeLabel')} ${Math.round(backupData.length / 1024)} ${t('kb')}`);
+
       } catch (error) {
-        currentWindow.alert(`${t('dropboxSaveFailedPrefix')}\n\n${error.message}`);
+        ESM_DIAG.error('Dropbox backup failed:', error);
+        alert(`${t('dropboxSaveFailedPrefix')}\n\n${error.message}`);
       }
     }
 
+    // Import backup from Dropbox
+    // Import backup from Dropbox
     async function importFromDropbox() {
       try {
+        ESM_DIAG.log('Starting Dropbox restore...');
+
+        // Token ermitteln (kein OAuth)
+        let listJson;
         const accessToken = await authenticateDropbox();
         const account = await getDropboxAccount(accessToken);
         const userFolder = `/WME_Backups/${account && account.account_id ? account.account_id : 'unknown'}`;
-        
-        const listRes = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL}/files/list_folder`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${accessToken}`
-          },
-          body: { path: userFolder, recursive: false }
-        });
-        if (listRes.status < 200 || listRes.status >= 300) throw new Error(listRes.responseText);
-        const listJson = JSON.parse(listRes.responseText);
+        if (typeof GM_xmlhttpRequest === 'function') {
+          ESM_DIAG.log('Listing backup files from Dropbox via GM_xmlhttpRequest...');
+          const gmRes = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL}/files/list_folder`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${accessToken}`
+            },
+            body: { path: userFolder, recursive: false }
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox list (GM) failed:', err);
+            throw new Error(`Network error during Dropbox file listing (GM): ${err.message}`);
+          });
+          if (gmRes.status < 200 || gmRes.status >= 300) {
+            const errorText = gmRes.responseText || 'Unknown error';
+            ESM_DIAG.error('Dropbox list (GM) failed:', gmRes.status, errorText);
+            throw new Error(`List request failed: ${gmRes.status} - ${errorText}`);
+          }
+          try {
+            listJson = JSON.parse(gmRes.responseText);
+          } catch (err) {
+            ESM_DIAG.error('Failed to parse list response (GM):', err);
+            throw new Error(`Invalid response format from Dropbox list (GM): ${err.message}`);
+          }
+        } else {
+          ESM_DIAG.log('Listing backup files from Dropbox via same-origin proxy...');
+          const listUrl = `${DROPBOX_CONFIG.PROXY_BASE_URL}/files/list_folder`;
+          const listResponse = await fetch(listUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...getCsrfHeaders()
+            },
+            credentials: 'include',
+            body: JSON.stringify({
+              path: userFolder,
+              recursive: false
+            })
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox list fetch failed:', err);
+            throw new Error(`Network error during Dropbox file listing: ${err.message}`);
+          });
+          if (!listResponse.ok) {
+            const errorText = await listResponse.text().catch(() => 'Unknown error');
+            ESM_DIAG.error('Dropbox list request failed:', listResponse.status, listResponse.statusText, errorText);
+            throw new Error(`List request failed: ${listResponse.status} ${listResponse.statusText} - ${errorText}`);
+          }
+          listJson = await listResponse.json().catch(err => {
+            ESM_DIAG.error('Failed to parse list response:', err);
+            throw new Error(`Invalid response format from Dropbox list: ${err.message}`);
+          });
+        }
 
         const files = listJson.entries ? listJson.entries.filter(entry =>
           entry['.tag'] === 'file' && entry.name.includes('wme_settings_backup')
         ) : [];
 
-        if (files.length === 0) {
-          currentWindow.alert(t('dropboxNoBackups'));
+        if (!files || files.length === 0) {
+          alert(t('dropboxNoBackups'));
           return;
         }
 
-        let fileList = 'Dropbox Backups:\n\n';
+        // Show file selection dialog
+        let fileList = 'Verfügbare Backups in Dropbox:\n\n';
         files.forEach((file, index) => {
-          const date = new Date(file.client_modified).toLocaleString();
-          fileList += `${index + 1}. ${file.name} (${date})\n`;
+          const date = new Date(file.client_modified).toLocaleString('de-DE');
+          const size = file.size ? `${Math.round(file.size / 1024)} KB` : 'Unbekannt';
+          fileList += `${index + 1}. ${file.name}\n   Erstellt: ${date}\n   Größe: ${size}\n\n`;
         });
 
-        const selection = currentWindow.prompt(`${fileList}\n${t('restorePrompt')} (1-${files.length})`);
+        const selection = prompt(`${fileList}${t('restorePrompt')} (1-${files.length})`);
         if (!selection) return;
 
         const fileIndex = parseInt(selection) - 1;
         if (fileIndex < 0 || fileIndex >= files.length) {
-          currentWindow.alert(t('invalidSelection'));
+          alert(t('invalidSelection'));
           return;
         }
 
         const selectedFile = files[fileIndex];
-        const dlRes = await gmFetch(`${DROPBOX_CONFIG.CONTENT_API_URL}/files/download`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Dropbox-API-Arg': JSON.stringify({ path: selectedFile.path_lower })
-          }
-        });
-        if (dlRes.status < 200 || dlRes.status >= 300) throw new Error(dlRes.responseText);
 
-        const parsed = JSON.parse(dlRes.responseText);
-        importedData = parsed;
-        const pairs = processParsedBackup(parsed);
-        displayKeyList(pairs);
-        if (applyButton) applyButton.style.display = 'block';
-        currentWindow.alert(`${t('dropboxLoadSuccessPrefix')}\n\n${t('fileLabel')} ${selectedFile.name}`);
+        // Download the selected file from Dropbox
+        let backupData;
+        if (typeof GM_xmlhttpRequest === 'function') {
+          ESM_DIAG.log('Downloading backup file from Dropbox via GM_xmlhttpRequest:', selectedFile.name);
+          const gmRes = await gmFetch(`${DROPBOX_CONFIG.CONTENT_API_URL}/files/download`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Dropbox-API-Arg': JSON.stringify({ path: selectedFile.path_lower })
+            },
+            responseType: 'text'
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox download (GM) failed:', err);
+            throw new Error(`Network error during Dropbox download (GM): ${err.message}`);
+          });
+          if (gmRes.status < 200 || gmRes.status >= 300) {
+            const errorText = gmRes.responseText || 'Unknown error';
+            ESM_DIAG.error('Dropbox download (GM) failed:', gmRes.status, errorText);
+            throw new Error(`Download failed: ${gmRes.status} - ${errorText}`);
+          }
+          backupData = gmRes.responseText;
+        } else {
+          ESM_DIAG.log('Downloading backup file from Dropbox via same-origin proxy:', selectedFile.name);
+          const downloadUrl = `${DROPBOX_CONFIG.PROXY_BASE_URL}/files/download`;
+          const downloadResponse = await fetch(downloadUrl, {
+            method: 'POST',
+            headers: {
+              'Dropbox-API-Arg': JSON.stringify({ path: selectedFile.path_lower }),
+              ...getCsrfHeaders()
+            },
+            credentials: 'include'
+          }).catch(err => {
+            ESM_DIAG.error('Dropbox download fetch failed:', err);
+            throw new Error(`Network error during Dropbox download: ${err.message}`);
+          });
+          if (!downloadResponse.ok) {
+            const errorText = await downloadResponse.text().catch(() => 'Unknown error');
+            ESM_DIAG.error('Dropbox download failed:', downloadResponse.status, downloadResponse.statusText, errorText);
+            throw new Error(`Download failed: ${downloadResponse.status} ${downloadResponse.statusText} - ${errorText}`);
+          }
+          backupData = await downloadResponse.text().catch(err => {
+            ESM_DIAG.error('Failed to read download response:', err);
+            throw new Error(`Failed to read backup data: ${err.message}`);
+          });
+        }
+
+        try {
+          const parsed = JSON.parse(backupData);
+          importedData = parsed;
+          let keyValuePairs = [];
+          const originOk = !(parsed && parsed.meta && parsed.meta.origin) || parsed.meta.origin === location.origin;
+
+          if (parsed && typeof parsed === 'object' && (parsed.localStorage || parsed.sessionStorage || parsed.cookies || parsed.indexedDB)) {
+            if (parsed.localStorage) {
+              for (const [k, v] of Object.entries(parsed.localStorage)) {
+                keyValuePairs.push([`localStorage:${k}`, v]);
+              }
+            }
+            if (parsed.sessionStorage && originOk) {
+              for (const [k, v] of Object.entries(parsed.sessionStorage)) {
+                keyValuePairs.push([`sessionStorage:${k}`, v]);
+              }
+            }
+            if (Array.isArray(parsed.cookies) && originOk) {
+              for (const c of parsed.cookies) {
+                if (c && c.name != null) {
+                  keyValuePairs.push([`cookie:${c.name}`, (c && typeof c.value !== 'undefined' && c.value !== null) ? c.value : '']);
+                }
+              }
+            }
+            if (Array.isArray(parsed.indexedDB)) {
+              for (const dbBackup of parsed.indexedDB) {
+                const dbName = (dbBackup && dbBackup.name) ? dbBackup.name : undefined;
+                if (!dbName || !Array.isArray(dbBackup.stores)) continue;
+                for (const storeBackup of dbBackup.stores) {
+                  const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
+                  if (!storeName || !Array.isArray(storeBackup.entries)) continue;
+                  for (const entry of storeBackup.entries) {
+                    const keyStr = JSON.stringify(entry.key);
+                    const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
+                    const valueObj = {
+                      db: dbName,
+                      store: storeName,
+                      key: entry.key,
+                      value: entry.value,
+                      keyPath: (storeBackup && typeof storeBackup.keyPath !== 'undefined') ? storeBackup.keyPath : null,
+                      autoIncrement: !!storeBackup.autoIncrement,
+                      indexes: Array.isArray(storeBackup.indexes) ? storeBackup.indexes : []
+                    };
+                    keyValuePairs.push([keyLabel, valueObj]);
+                  }
+                }
+              }
+            }
+          } else {
+            keyValuePairs = Object.entries(parsed);
+          }
+
+          displayKeyList(keyValuePairs);
+          if (applyButton) applyButton.style.display = 'block';
+
+          if (!originOk) {
+            alert(t('foreignBackupHint'));
+          } else {
+            alert(`${t('dropboxLoadSuccessPrefix')}\n\n${t('fileLabel')} ${selectedFile.name}\n${t('foundEntriesLabel')} ${keyValuePairs.length}`);
+          }
+
+        } catch (parseError) {
+          ESM_DIAG.error('Failed to parse backup data:', parseError);
+          alert(t('invalidJson'));
+        }
+
       } catch (error) {
-        currentWindow.alert(`${t('dropboxRestoreFailedPrefix')}\n\n${error.message}`);
+        ESM_DIAG.error('Dropbox restore failed:', error);
+        alert(`${t('dropboxRestoreFailedPrefix')}\n\n${error.message}`);
       }
     }
 
+    // ===== Google Drive API Configuration & Functions =====
+    const GDRIVE_CONFIG = {
+      // WICHTIG: Eigene OAuth Client ID hier eintragen!
+      // Erstelle unter https://console.cloud.google.com/apis/credentials eine OAuth 2.0 Client-ID (Web-App).
+      // Authorized JavaScript Origins: https://www.waze.com
+      // Authorized Redirect URI: https://www.waze.com/oauth2callback
+      CLIENT_ID: '190557226782-nousklt3lu6lkse9umfsurqhcqhr30vs.apps.googleusercontent.com',
+      SCOPES: 'https://www.googleapis.com/auth/drive.appdata',
+      UPLOAD_URL: 'https://www.googleapis.com/upload/drive/v3/files',
+      FILES_URL: 'https://www.googleapis.com/drive/v3/files'
+    };
+    const GDRIVE_TOKEN_KEY = 'ESM_GDRIVE_TOKEN';
+    const GDRIVE_TOKEN_EXPIRES_KEY = 'ESM_GDRIVE_TOKEN_EXPIRES';
+    const GDRIVE_TOKEN_SCOPE_KEY = 'ESM_GDRIVE_TOKEN_SCOPE';
+    let gdriveAuth = null;
+
+    function loadGdriveToken() {
+      try {
+        const token = localStorage.getItem(GDRIVE_TOKEN_KEY);
+        const exp = parseInt(localStorage.getItem(GDRIVE_TOKEN_EXPIRES_KEY) || '0', 10);
+        const savedScope = localStorage.getItem(GDRIVE_TOKEN_SCOPE_KEY) || '';
+        // Token ungültig wenn abgelaufen oder Scope geändert
+        if (token && exp && Date.now() < (exp - 60000) && savedScope === GDRIVE_CONFIG.SCOPES) { gdriveAuth = token; return token; }
+        // Alten Token löschen wenn Scope nicht passt
+        if (savedScope && savedScope !== GDRIVE_CONFIG.SCOPES) {
+          ESM_DIAG.log('Google Drive Scope geändert, alter Token wird gelöscht.');
+          clearGdriveToken();
+        }
+      } catch (_) {}
+      return null;
+    }
+
+    function saveGdriveToken(token, expiresIn) {
+      try {
+        localStorage.setItem(GDRIVE_TOKEN_KEY, token);
+        const expiresAt = expiresIn ? (Date.now() + (expiresIn * 1000)) : (Date.now() + 3600000);
+        localStorage.setItem(GDRIVE_TOKEN_EXPIRES_KEY, String(expiresAt));
+        localStorage.setItem(GDRIVE_TOKEN_SCOPE_KEY, GDRIVE_CONFIG.SCOPES);
+        gdriveAuth = token;
+        ESM_DIAG.log('Google Drive Token gespeichert.');
+      } catch (e) { ESM_DIAG.warn('Konnte Google Drive Token nicht speichern:', e); }
+    }
+
+    function clearGdriveToken() {
+      try {
+        localStorage.removeItem(GDRIVE_TOKEN_KEY);
+        localStorage.removeItem(GDRIVE_TOKEN_EXPIRES_KEY);
+        localStorage.removeItem(GDRIVE_TOKEN_SCOPE_KEY);
+        gdriveAuth = null;
+        ESM_DIAG.log('Google Drive Token gelöscht.');
+      } catch (e) { ESM_DIAG.warn('Konnte Google Drive Token nicht löschen:', e); }
+    }
+
+    // OAuth 2.0 Implicit Flow via Popup – User sieht nur den Google Login Screen
+    function oauthGoogleImplicit() {
+      return new Promise((resolve, reject) => {
+        const state = Math.random().toString(36).slice(2);
+        try { sessionStorage.setItem('ESM_GOOGLE_OAUTH_STATE', state); } catch (_) {}
+
+        const redirectUri = location.origin + '/oauth2callback';
+        const params = new URLSearchParams({
+          client_id: GDRIVE_CONFIG.CLIENT_ID,
+          redirect_uri: redirectUri,
+          response_type: 'token',
+          scope: GDRIVE_CONFIG.SCOPES,
+          state: state,
+          include_granted_scopes: 'true',
+          prompt: 'consent'
+        }).toString();
+
+        const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+        const popup = window.open(authUrl, 'esm_google_oauth', 'width=500,height=600');
+        if (!popup) { reject(new Error(ESM_LANG === 'de' ? 'Popup blockiert – bitte Popup-Blocker deaktivieren' : 'Popup blocked – please disable popup blocker')); return; }
+
+        const timer = setTimeout(() => { clearInterval(pollInterval); reject(new Error('Google OAuth timeout (3 min)')); }, 180000);
+
+        const pollInterval = setInterval(() => {
+          try {
+            if (!popup || popup.closed) { clearInterval(pollInterval); clearTimeout(timer); reject(new Error(ESM_LANG === 'de' ? 'OAuth-Fenster wurde geschlossen' : 'OAuth window was closed')); return; }
+            const popupUrl = popup.location.href;
+            if (popupUrl && popupUrl.startsWith(location.origin)) {
+              clearInterval(pollInterval); clearTimeout(timer); popup.close();
+              const hash = popupUrl.split('#')[1] || '';
+              const fragParams = new URLSearchParams(hash);
+              const accessToken = fragParams.get('access_token');
+              const expiresIn = parseInt(fragParams.get('expires_in') || '3600', 10);
+              const returnedState = fragParams.get('state');
+              const error = fragParams.get('error');
+              if (error) { reject(new Error(`Google OAuth: ${error}`)); return; }
+              const savedState = sessionStorage.getItem('ESM_GOOGLE_OAUTH_STATE');
+              if (savedState && returnedState && savedState !== returnedState) { reject(new Error('Invalid OAuth state')); return; }
+              if (!accessToken) { reject(new Error('No access token in response')); return; }
+              saveGdriveToken(accessToken, expiresIn);
+              resolve(accessToken);
+            }
+          } catch (e) { /* cross-origin – popup still on Google, keep polling */ }
+        }, 500);
+      });
+    }
+
+    async function authenticateGdrive() {
+      const existing = loadGdriveToken();
+      if (existing) return existing;
+      return await oauthGoogleImplicit();
+    }
+
+    // Find or create the WME_Backups folder in Google Drive
+    // Mit drive.appdata nutzen wir den versteckten appDataFolder – kein Ordner erstellen nötig.
+    // Google Drive stellt automatisch einen privaten App-Ordner bereit.
+    const GDRIVE_APP_FOLDER = 'appDataFolder';
+
+    // Export backup to Google Drive
+    async function exportToGoogleDrive() {
+      try {
+        ESM_DIAG.log('Starting Google Drive backup...');
+        if (typeof GM_xmlhttpRequest !== 'function') {
+          throw new Error('GM_xmlhttpRequest not available – Google Drive requires Userscript manager');
+        }
+        const accessToken = await authenticateGdrive();
+
+        // Generate backup data
+        const backup = {
+          meta: {
+            exportedAt: new Date().toISOString(),
+            origin: location.origin,
+            scriptVersion,
+            backupType: 'googledrive'
+          },
+          localStorage: (() => {
+            const out = {};
+            try {
+              const len = window.localStorage.length;
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.localStorage, i);
+                if (k != null) out[k] = NativeStorage.getItem.call(window.localStorage, k);
+              }
+            } catch (e) {
+              Object.keys(window.localStorage).forEach(k => { try { out[k] = window.localStorage.getItem(k); } catch (_) { out[k] = null; } });
+            }
+            return out;
+          })(),
+          sessionStorage: (() => {
+            const out = {};
+            try {
+              const len = window.sessionStorage.length;
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.sessionStorage, i);
+                if (k != null) out[k] = NativeStorage.getItem.call(window.sessionStorage, k);
+              }
+            } catch (e) {
+              Object.keys(window.sessionStorage).forEach(k => { try { out[k] = window.sessionStorage.getItem(k); } catch (_) { out[k] = null; } });
+            }
+            return out;
+          })(),
+          cookies: document.cookie.split(';').map(c => { const [name, ...rest] = c.trim().split('='); return { name, value: rest.join('=') }; }).filter(c => c.name),
+          indexedDB: await backupIndexedDB()
+        };
+
+        const backupData = JSON.stringify(backup, null, 2);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fileName = `wme_settings_backup_${timestamp}.json`;
+
+        // Multipart upload to Google Drive
+        const boundary = '===ESM_GDRIVE_BOUNDARY===';
+        const metadata = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+        const multipartBody =
+          `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+          `--${boundary}\r\nContent-Type: application/json\r\n\r\n${backupData}\r\n` +
+          `--${boundary}--`;
+
+        const uploadRes = await gmFetch(`${GDRIVE_CONFIG.UPLOAD_URL}?uploadType=multipart`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': `multipart/related; boundary=${boundary}`
+          },
+          body: multipartBody
+        });
+
+        if (uploadRes.status < 200 || uploadRes.status >= 300) {
+          const errorText = uploadRes.responseText || 'Unknown error';
+          throw new Error(`Upload failed: ${uploadRes.status} - ${errorText}`);
+        }
+
+        const result = JSON.parse(uploadRes.responseText);
+        ESM_DIAG.log('Backup uploaded to Google Drive:', result);
+        alert(`${t('gdriveSaveSuccess')}\n\n${t('fileLabel')} ${fileName}\n${t('sizeLabel')} ${Math.round(backupData.length / 1024)} ${t('kb')}`);
+      } catch (error) {
+        ESM_DIAG.error('Google Drive backup failed:', error);
+        alert(`${t('gdriveSaveFailed')}\n\n${error.message}`);
+      }
+    }
+
+    // Import backup from Google Drive
+    async function importFromGoogleDrive() {
+      try {
+        ESM_DIAG.log('Starting Google Drive restore...');
+        if (typeof GM_xmlhttpRequest !== 'function') {
+          throw new Error('GM_xmlhttpRequest not available – Google Drive requires Userscript manager');
+        }
+        const accessToken = await authenticateGdrive();
+
+        // List backup files in appDataFolder
+        const listUrl = `${GDRIVE_CONFIG.FILES_URL}?spaces=appDataFolder&q=${encodeURIComponent("name contains 'wme_settings_backup'")}&fields=files(id,name,size,modifiedTime)&orderBy=modifiedTime%20desc`;
+        ESM_DIAG.log('Google Drive list URL:', listUrl);
+        const listRes = await gmFetch(listUrl, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+
+        if (listRes.status < 200 || listRes.status >= 300) {
+          throw new Error(`List request failed: ${listRes.status} - ${listRes.responseText || ''}`);
+        }
+
+        const listData = JSON.parse(listRes.responseText);
+        const files = (listData.files || []).filter(f => f.name.includes('wme_settings_backup'));
+
+        if (!files.length) {
+          alert(t('gdriveNoBackups'));
+          return;
+        }
+
+        let fileList = (ESM_LANG === 'de' ? 'Verfügbare Backups in Google Drive:\n\n' : 'Available backups in Google Drive:\n\n');
+        files.forEach((file, index) => {
+          const date = new Date(file.modifiedTime).toLocaleString(ESM_LANG === 'de' ? 'de-DE' : 'en-US');
+          const size = file.size ? `${Math.round(parseInt(file.size) / 1024)} KB` : '?';
+          fileList += `${index + 1}. ${file.name}\n   ${ESM_LANG === 'de' ? 'Geändert' : 'Modified'}: ${date}\n   ${t('sizeLabel')} ${size}\n\n`;
+        });
+
+        const selection = prompt(`${fileList}${t('restorePrompt')} (1-${files.length})`);
+        if (!selection) return;
+
+        const fileIndex = parseInt(selection) - 1;
+        if (fileIndex < 0 || fileIndex >= files.length) {
+          alert(t('invalidSelection'));
+          return;
+        }
+
+        const selectedFile = files[fileIndex];
+
+        // Download file content
+        const downloadRes = await gmFetch(`${GDRIVE_CONFIG.FILES_URL}/${selectedFile.id}?alt=media`, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${accessToken}` },
+          responseType: 'text'
+        });
+
+        if (downloadRes.status < 200 || downloadRes.status >= 300) {
+          throw new Error(`Download failed: ${downloadRes.status} - ${downloadRes.responseText || ''}`);
+        }
+
+        const backupData = downloadRes.responseText;
+        try {
+          const parsed = JSON.parse(backupData);
+          importedData = parsed;
+          let keyValuePairs = [];
+          const originOk = !(parsed && parsed.meta && parsed.meta.origin) || parsed.meta.origin === location.origin;
+
+          if (parsed && typeof parsed === 'object' && (parsed.localStorage || parsed.sessionStorage || parsed.cookies || parsed.indexedDB)) {
+            if (parsed.localStorage) {
+              for (const [k, v] of Object.entries(parsed.localStorage)) keyValuePairs.push([`localStorage:${k}`, v]);
+            }
+            if (parsed.sessionStorage && originOk) {
+              for (const [k, v] of Object.entries(parsed.sessionStorage)) keyValuePairs.push([`sessionStorage:${k}`, v]);
+            }
+            if (Array.isArray(parsed.cookies) && originOk) {
+              for (const c of parsed.cookies) {
+                if (c && c.name != null) keyValuePairs.push([`cookie:${c.name}`, (c && typeof c.value !== 'undefined' && c.value !== null) ? c.value : '']);
+              }
+            }
+            if (Array.isArray(parsed.indexedDB)) {
+              for (const dbBackup of parsed.indexedDB) {
+                const dbName = (dbBackup && dbBackup.name) ? dbBackup.name : undefined;
+                if (!dbName || !Array.isArray(dbBackup.stores)) continue;
+                for (const storeBackup of dbBackup.stores) {
+                  const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
+                  if (!storeName || !Array.isArray(storeBackup.entries)) continue;
+                  for (const entry of storeBackup.entries) {
+                    const keyStr = JSON.stringify(entry.key);
+                    const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
+                    keyValuePairs.push([keyLabel, { db: dbName, store: storeName, key: entry.key, value: entry.value, keyPath: storeBackup.keyPath || null, autoIncrement: !!storeBackup.autoIncrement, indexes: Array.isArray(storeBackup.indexes) ? storeBackup.indexes : [] }]);
+                  }
+                }
+              }
+            }
+          } else {
+            keyValuePairs = Object.entries(parsed);
+          }
+
+          displayKeyList(keyValuePairs);
+          if (applyButton) applyButton.style.display = 'block';
+
+          if (!originOk) {
+            alert(t('foreignBackupHint'));
+          } else {
+            alert(`${t('gdriveLoadSuccess')}\n\n${t('fileLabel')} ${selectedFile.name}\n${t('foundEntriesLabel')} ${keyValuePairs.length}`);
+          }
+        } catch (parseError) {
+          ESM_DIAG.error('Failed to parse Google Drive backup data:', parseError);
+          alert(t('invalidJson'));
+        }
+      } catch (error) {
+        ESM_DIAG.error('Google Drive restore failed:', error);
+        alert(`${t('gdriveRestoreFailed')}\n\n${error.message}`);
+      }
+    }
+
+    // ===== Google Drive Help Panel (UI) – mit Login-Button statt Token-Eingabe =====
+    function injectGdriveHelpPanel(parent) {
+      try {
+        if (document.getElementById('esm-gdrive-help-panel')) return;
+        const inline = !!parent;
+        const hiddenKey = inline ? 'ESM_GDRIVE_HELP_TAB_HIDDEN' : 'ESM_GDRIVE_HELP_HIDDEN';
+        const hidden = localStorage.getItem(hiddenKey) === '1';
+        const wrapper = document.createElement('div');
+        wrapper.id = 'esm-gdrive-help-panel';
+        wrapper.style.fontFamily = "system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif";
+        wrapper.style.color = '#111827';
+        if (!inline) {
+          wrapper.style.position = 'fixed'; wrapper.style.bottom = '16px'; wrapper.style.right = '16px'; wrapper.style.zIndex = '2147483645';
+        } else {
+          wrapper.style.marginTop = '10px'; wrapper.style.width = '100%';
+        }
+        const card = document.createElement('div');
+        card.style.background = '#ffffff'; card.style.border = '1px solid #e5e7eb'; card.style.borderRadius = '12px'; card.style.overflow = 'hidden';
+        if (!inline) { card.style.boxShadow = '0 6px 18px rgba(0,0,0,0.12)'; card.style.width = '340px'; card.style.maxWidth = '90vw'; }
+        else { card.style.boxShadow = 'none'; card.style.width = '100%'; card.style.maxWidth = '100%'; }
+
+        const header = document.createElement('div');
+        header.style.display = 'flex'; header.style.alignItems = 'center'; header.style.justifyContent = 'space-between';
+        header.style.padding = '10px 12px'; header.style.background = '#f9fafb'; header.style.borderBottom = '1px solid #e5e7eb';
+        const title = document.createElement('div');
+        title.textContent = t('gdrivePanelTitle'); title.style.fontSize = '13px'; title.style.fontWeight = '600';
+        const btnHide = document.createElement('button');
+        btnHide.textContent = hidden ? t('show') : t('hide');
+        btnHide.style.fontSize = '12px'; btnHide.style.border = '1px solid #d1d5db'; btnHide.style.background = '#ffffff';
+        btnHide.style.borderRadius = '8px'; btnHide.style.padding = '4px 8px'; btnHide.style.cursor = 'pointer';
+        btnHide.addEventListener('click', () => {
+          const vis = content.style.display !== 'none';
+          content.style.display = vis ? 'none' : 'block';
+          btnHide.textContent = vis ? t('show') : t('hide');
+          try { localStorage.setItem(hiddenKey, vis ? '1' : '0'); } catch (_) {}
+        });
+        header.appendChild(title); header.appendChild(btnHide);
+
+        const content = document.createElement('div');
+        content.style.padding = '12px'; content.style.display = hidden ? 'none' : 'block';
+
+        const statusEl = document.createElement('div');
+        statusEl.id = 'esm-gdrive-status';
+        statusEl.style.fontSize = '12px'; statusEl.style.marginBottom = '8px'; statusEl.style.color = '#374151';
+
+        // Google-Style Login Button
+        const loginBtn = document.createElement('button');
+        loginBtn.style.display = 'flex'; loginBtn.style.alignItems = 'center'; loginBtn.style.gap = '8px';
+        loginBtn.style.width = '100%'; loginBtn.style.padding = '8px 12px';
+        loginBtn.style.fontSize = '13px'; loginBtn.style.fontWeight = '500';
+        loginBtn.style.border = '1px solid #dadce0'; loginBtn.style.borderRadius = '8px';
+        loginBtn.style.background = '#fff'; loginBtn.style.cursor = 'pointer';
+        loginBtn.style.transition = 'background 150ms ease, box-shadow 150ms ease';
+        loginBtn.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)';
+        loginBtn.addEventListener('mouseenter', () => { loginBtn.style.background = '#f8f9fa'; loginBtn.style.boxShadow = '0 2px 6px rgba(0,0,0,0.12)'; });
+        loginBtn.addEventListener('mouseleave', () => { loginBtn.style.background = '#fff'; loginBtn.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; });
+        const gLogo = document.createElement('span');
+        gLogo.innerHTML = '<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>';
+        loginBtn.appendChild(gLogo);
+        const loginText = document.createElement('span');
+        loginBtn.appendChild(loginText);
+
+        // Logout Button
+        const logoutBtn = document.createElement('button');
+        logoutBtn.style.width = '100%'; logoutBtn.style.marginTop = '6px';
+        logoutBtn.style.fontSize = '12px'; logoutBtn.style.padding = '6px 8px';
+        logoutBtn.style.border = '1px solid #ef4444'; logoutBtn.style.background = '#ef4444'; logoutBtn.style.color = '#fff';
+        logoutBtn.style.borderRadius = '8px'; logoutBtn.style.cursor = 'pointer';
+
+        function updateGdriveUI() {
+          const token = loadGdriveToken();
+          if (token) {
+            statusEl.textContent = ESM_LANG === 'de' ? '✅ Mit Google Drive verbunden.' : '✅ Connected to Google Drive.';
+            statusEl.style.color = '#065f46';
+            loginBtn.style.display = 'none';
+            logoutBtn.style.display = 'block';
+            logoutBtn.textContent = ESM_LANG === 'de' ? 'Abmelden' : 'Sign out';
+          } else {
+            statusEl.textContent = ESM_LANG === 'de' ? 'Nicht angemeldet.' : 'Not signed in.';
+            statusEl.style.color = '#374151';
+            loginBtn.style.display = 'flex';
+            loginText.textContent = ESM_LANG === 'de' ? 'Mit Google anmelden' : 'Sign in with Google';
+            logoutBtn.style.display = 'none';
+          }
+        }
+
+        loginBtn.addEventListener('click', async () => {
+          try {
+            statusEl.textContent = ESM_LANG === 'de' ? 'Anmeldung läuft...' : 'Signing in...';
+            statusEl.style.color = '#374151';
+            await oauthGoogleImplicit();
+            updateGdriveUI();
+          } catch (e) {
+            statusEl.textContent = `${ESM_LANG === 'de' ? 'Fehler' : 'Error'}: ${e.message}`;
+            statusEl.style.color = '#b91c1c';
+          }
+        });
+
+        logoutBtn.addEventListener('click', () => { clearGdriveToken(); updateGdriveUI(); });
+
+        content.appendChild(statusEl);
+        content.appendChild(loginBtn);
+        content.appendChild(logoutBtn);
+        updateGdriveUI();
+
+        card.appendChild(header); card.appendChild(content); wrapper.appendChild(card);
+        if (inline && parent) parent.appendChild(wrapper);
+        else document.documentElement.appendChild(wrapper);
+      } catch (e) {
+        ESM_DIAG.warn('Konnte Google Drive Hilfspanel nicht einfügen:', e);
+      }
+    }
+
+    // Export helpers to window
+    try {
+      window.ESM_clearGdriveToken = clearGdriveToken;
+      window.ESM_startGoogleOAuth = oauthGoogleImplicit;
+    } catch (_) {}
+
+    // Export local storage data to a JSON file
     async function backupIndexedDB() {
       const result = [];
       let dbs = [];
       try {
-        if (indexedDB.databases) dbs = await indexedDB.databases();
-      } catch (e) {}
+        if (indexedDB.databases) {
+          dbs = await indexedDB.databases();
+        }
+      } catch (e) {
+        dbs = [];
+      }
       for (const info of dbs) {
         if (!info || !info.name) continue;
+        const name = info.name;
+        const metaVersion = info.version;
         const backupForDb = await new Promise((resolve) => {
-          const req = indexedDB.open(info.name);
+          const req = indexedDB.open(name);
           req.onerror = () => resolve(null);
+          req.onupgradeneeded = () => {
+            // No schema changes on read
+          };
           req.onsuccess = () => {
             const db = req.result;
+            const storeBackups = [];
             const stores = Array.from(db.objectStoreNames);
-            const storePromises = stores.map(storeName => new Promise(res => {
+            const perStorePromises = stores.map((storeName) => new Promise((res) => {
               try {
                 const tx = db.transaction([storeName], 'readonly');
                 const store = tx.objectStore(storeName);
-                const out = { 
-                  name: storeName, 
-                  keyPath: store.keyPath || null, 
-                  autoIncrement: store.autoIncrement || false, 
-                  indexes: Array.from(store.indexNames).map(ixN => {
-                    const idx = store.index(ixN);
-                    return { name: ixN, keyPath: idx.keyPath, unique: !!idx.unique, multiEntry: !!idx.multiEntry };
-                  }),
-                  entries: [] 
-                };
-                const cursorReq = store.openCursor();
-                cursorReq.onsuccess = (e) => {
-                  const cursor = e.target.result;
-                  if (cursor) {
-                    out.entries.push({ key: cursor.key, value: cursor.value });
-                    cursor.continue();
-                  } else res(out);
-                };
-                cursorReq.onerror = () => res(out);
-              } catch (err) { res(null); }
+                const keyPath = store.keyPath || null;
+                const autoIncrement = store.autoIncrement || false;
+                const indexes = Array.from(store.indexNames).map((indexName) => {
+                  const idx = store.index(indexName);
+                  return { name: indexName, keyPath: idx.keyPath, unique: !!idx.unique, multiEntry: !!idx.multiEntry };
+                });
+                const out = { name: storeName, keyPath, autoIncrement, indexes, entries: [] };
+                if (store.getAll && store.getAllKeys) {
+                  const keysReq = store.getAllKeys();
+                  const valsReq = store.getAll();
+                  keysReq.onsuccess = () => {
+                    const keys = keysReq.result || [];
+                    valsReq.onsuccess = () => {
+                      const vals = valsReq.result || [];
+                      const len = Math.max(keys.length, vals.length);
+                      for (let i = 0; i < len; i++) {
+                        out.entries.push({ key: keys[i], value: vals[i] });
+                      }
+                      storeBackups.push(out);
+                      res(true);
+                    };
+                    valsReq.onerror = () => { storeBackups.push(out); res(true); };
+                  };
+                  keysReq.onerror = () => { storeBackups.push(out); res(true); };
+                } else {
+                  const request = store.openCursor();
+                  request.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                      out.entries.push({ key: cursor.key, value: cursor.value });
+                      cursor.continue();
+                    } else {
+                      storeBackups.push(out);
+                      res(true);
+                    }
+                  };
+                  request.onerror = () => { storeBackups.push(out); res(true); };
+                }
+              } catch (err) {
+                res(true);
+              }
             }));
-            Promise.all(storePromises).then(storeData => {
-              const obj = { name: info.name, version: db.version, stores: storeData.filter(x => x) };
+            Promise.all(perStorePromises).then(() => {
+              const backupObj = { name, version: db.version || metaVersion || null, stores: storeBackups };
               db.close();
-              resolve(obj);
+              resolve(backupObj);
             });
           };
         });
@@ -666,44 +1698,548 @@
       }
       return result;
     }
+    // ===== Toast Notification =====
+    function esmToast(message, type) {
+      // type: 'success', 'error', 'info'
+      try {
+        // Altes Toast entfernen falls vorhanden
+        var old = document.getElementById('esm-toast');
+        if (old) old.remove();
 
-    async function generateFullBackup() {
+        var colors = {
+          success: { bg: '#1b5e20', border: '#4caf50', icon: '✅' },
+          error:   { bg: '#b71c1c', border: '#f44336', icon: '❌' },
+          info:    { bg: '#0d47a1', border: '#2196f3', icon: 'ℹ️' }
+        };
+        var c = colors[type] || colors.info;
+
+        var toast = document.createElement('div');
+        toast.id = 'esm-toast';
+        toast.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483647;'
+          + 'background:' + c.bg + ';color:#fff;border:1px solid ' + c.border + ';'
+          + 'border-radius:10px;padding:10px 16px;font-size:13px;font-family:system-ui,sans-serif;'
+          + 'box-shadow:0 4px 16px rgba(0,0,0,0.35);display:flex;align-items:center;gap:8px;'
+          + 'max-width:360px;opacity:0;transform:translateY(20px);'
+          + 'transition:opacity 300ms ease,transform 300ms ease;pointer-events:auto;';
+
+        var icon = document.createElement('span');
+        icon.textContent = c.icon;
+        icon.style.fontSize = '16px';
+        toast.appendChild(icon);
+
+        var text = document.createElement('span');
+        text.textContent = message;
+        text.style.flex = '1';
+        toast.appendChild(text);
+
+        var closeBtn = document.createElement('span');
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = 'cursor:pointer;opacity:0.7;font-size:14px;margin-left:8px;';
+        closeBtn.addEventListener('click', function() { toast.remove(); });
+        toast.appendChild(closeBtn);
+
+        document.body.appendChild(toast);
+
+        // Einblenden
+        requestAnimationFrame(function() {
+          requestAnimationFrame(function() {
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateY(0)';
+          });
+        });
+
+        // Auto-Ausblenden nach 4s (Fehler 6s)
+        var duration = type === 'error' ? 6000 : 4000;
+        setTimeout(function() {
+          if (toast.parentNode) {
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(20px)';
+            setTimeout(function() { if (toast.parentNode) toast.remove(); }, 350);
+          }
+        }, duration);
+      } catch (_) {
+        // Fallback: console
+        ESM_DIAG.log('Toast (' + type + '):', message);
+      }
+    }
+
+    // ===== Auto Save Functions =====
+    function toggleAutoSave() {
+      var cb = document.getElementById('esm-autosave-cb');
+      var sel = document.getElementById('esm-autosave-interval');
+      if (!cb) return;
+
+      autoSaveEnabled = cb.checked;
+      try { localStorage.setItem(AUTO_SAVE_ENABLED_KEY, autoSaveEnabled ? '1' : '0'); } catch (_) {}
+
+      if (sel) sel.disabled = !autoSaveEnabled;
+
+      if (autoSaveInterval) { clearInterval(autoSaveInterval); autoSaveInterval = null; }
+
+      if (autoSaveEnabled) {
+        var ms = parseInt(sel ? sel.value : '300000');
+        try { localStorage.setItem(AUTO_SAVE_INTERVAL_KEY, String(ms)); } catch (_) {}
+        ESM_DIAG.log('Auto Save enabled (' + (ms / 60000) + ' min)');
+        esmToast('⏱️ Auto Save ' + (ESM_LANG === 'de' ? 'aktiviert' : 'enabled') + ' (' + (ms / 60000) + ' min)', 'success');
+        autoSaveInterval = setInterval(runAutoSave, ms);
+      } else {
+        ESM_DIAG.log('Auto Save disabled');
+        esmToast('⏱️ Auto Save ' + (ESM_LANG === 'de' ? 'deaktiviert' : 'disabled'), 'info');
+      }
+    }
+
+    function onAutoSaveIntervalChange() {
+      var sel = document.getElementById('esm-autosave-interval');
+      if (sel) { try { localStorage.setItem(AUTO_SAVE_INTERVAL_KEY, sel.value); } catch (_) {} }
+      if (autoSaveEnabled) toggleAutoSave();
+    }
+
+    function onAutoSaveTargetChange() {
+      var sel = document.getElementById('esm-autosave-target');
+      if (sel) { try { localStorage.setItem(AUTO_SAVE_TARGET_KEY, sel.value); } catch (_) {} }
+    }
+
+    function getAutoSaveMaxBackups() {
+      try {
+        var v = parseInt(localStorage.getItem(AUTO_SAVE_MAX_BACKUPS_KEY) || '1');
+        return (v >= 1 && v <= 10) ? v : 1;
+      } catch (_) { return 1; }
+    }
+
+    // Dropbox: alte Auto-Save Backups auflisten und älteste löschen
+    async function cleanupOldDropboxBackups(accessToken, userFolder, maxBackups) {
+      try {
+        var listRes = await gmFetch(DROPBOX_CONFIG.API_BASE_URL + '/files/list_folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + accessToken },
+          body: { path: userFolder, recursive: false }
+        });
+        if (listRes.status < 200 || listRes.status >= 300) return;
+        var listData = JSON.parse(listRes.responseText);
+        var autoFiles = (listData.entries || []).filter(function(e) {
+          return e['.tag'] === 'file' && e.name.indexOf('wme_autosave_') === 0;
+        });
+        autoFiles.sort(function(a, b) { return (a.client_modified || '').localeCompare(b.client_modified || ''); });
+        var toDelete = autoFiles.length - maxBackups;
+        for (var i = 0; i < toDelete; i++) {
+          await gmFetch(DROPBOX_CONFIG.API_BASE_URL + '/files/delete_v2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + accessToken },
+            body: { path: autoFiles[i].path_lower }
+          });
+          ESM_DIAG.log('Deleted old Dropbox backup:', autoFiles[i].name);
+        }
+      } catch (e) { ESM_DIAG.warn('Cleanup old Dropbox backups failed:', e); }
+    }
+
+    // Google Drive: alte Auto-Save Backups auflisten und älteste löschen
+    async function cleanupOldGdriveBackups(accessToken, maxBackups) {
+      try {
+        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=appDataFolder&q=' + encodeURIComponent("name contains 'wme_autosave_'") + '&fields=files(id,name,modifiedTime)&orderBy=modifiedTime%20asc';
+        var listRes = await gmFetch(listUrl, {
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + accessToken }
+        });
+        if (listRes.status < 200 || listRes.status >= 300) return;
+        var listData = JSON.parse(listRes.responseText);
+        var files = listData.files || [];
+        var toDelete = files.length - maxBackups;
+        for (var i = 0; i < toDelete; i++) {
+          await gmFetch(GDRIVE_CONFIG.FILES_URL + '/' + files[i].id, {
+            method: 'DELETE',
+            headers: { 'Authorization': 'Bearer ' + accessToken }
+          });
+          ESM_DIAG.log('Deleted old GDrive backup:', files[i].name);
+        }
+      } catch (e) { ESM_DIAG.warn('Cleanup old GDrive backups failed:', e); }
+    }
+
+    async function runAutoSave() {
+      var targetSel = document.getElementById('esm-autosave-target');
+      var target = (targetSel ? targetSel.value : 'local');
+      var maxBackups = getAutoSaveMaxBackups();
+      var targetNames = { local: t('autoSaveTargetLocal'), dropbox: t('autoSaveTargetDropbox'), gdrive: t('autoSaveTargetGdrive') };
+      var targetName = targetNames[target] || target;
+      ESM_DIAG.log('Auto Save running, target:', target, 'maxBackups:', maxBackups);
+      esmToast(t('autoSaveRunning') + ' → ' + targetName, 'info');
+      try {
+        if (target === 'local') {
+          await exportLocalStorage();
+        } else if (target === 'dropbox') {
+          await autoSaveToDropbox(maxBackups);
+        } else if (target === 'gdrive') {
+          await autoSaveToGdrive(maxBackups);
+        }
+        ESM_DIAG.log('Auto Save completed.');
+        var time = new Date().toLocaleTimeString();
+        esmToast(t('autoSaveDone') + ' (' + targetName + ', ' + time + ')', 'success');
+      } catch (e) {
+        ESM_DIAG.error('Auto Save failed:', e);
+        esmToast(t('autoSaveFailed') + ' ' + (e.message || e), 'error');
+      }
+    }
+
+    async function autoSaveToDropbox(maxBackups) {
+      var accessToken = await authenticateDropbox();
+      var account = await getDropboxAccount(accessToken);
+      var userFolder = '/WME_Backups/' + (account && account.account_id ? account.account_id : 'unknown');
+
+      var backup = await buildBackupData('dropbox');
+      var backupData = JSON.stringify(backup, null, 2);
+
+      var fileName;
+      var uploadMode;
+      if (maxBackups <= 1) {
+        fileName = 'wme_autosave_latest.json';
+        uploadMode = { '.tag': 'overwrite' };
+      } else {
+        var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        fileName = 'wme_autosave_' + timestamp + '.json';
+        uploadMode = 'add';
+      }
+
+      if (typeof GM_xmlhttpRequest === 'function') {
+        var gmRes = await gmFetch(DROPBOX_CONFIG.CONTENT_API_URL + '/files/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Authorization': 'Bearer ' + accessToken,
+            'Dropbox-API-Arg': JSON.stringify({ path: userFolder + '/' + fileName, mode: uploadMode, autorename: true })
+          },
+          body: backupData
+        });
+        if (gmRes.status < 200 || gmRes.status >= 300) throw new Error('Dropbox upload failed: ' + gmRes.status);
+      } else {
+        var response = await fetch(DROPBOX_CONFIG.PROXY_BASE_URL + '/files/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Dropbox-API-Arg': JSON.stringify({ path: userFolder + '/' + fileName, mode: uploadMode, autorename: true }),
+            ...getCsrfHeaders()
+          },
+          credentials: 'include',
+          body: backupData
+        });
+        if (!response.ok) throw new Error('Dropbox upload failed: ' + response.status);
+      }
+
+      if (maxBackups > 1) {
+        await cleanupOldDropboxBackups(accessToken, userFolder, maxBackups);
+      }
+      ESM_DIAG.log('Auto Save Dropbox done:', fileName);
+    }
+
+    async function autoSaveToGdrive(maxBackups) {
+      if (typeof GM_xmlhttpRequest !== 'function') throw new Error('GM_xmlhttpRequest not available');
+      var accessToken = await authenticateGdrive();
+
+      var backup = await buildBackupData('googledrive');
+      var backupData = JSON.stringify(backup, null, 2);
+
+      var fileName;
+      if (maxBackups <= 1) {
+        // Bei Überschreiben: bestehende Datei suchen und updaten
+        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=appDataFolder&q=' + encodeURIComponent("name = 'wme_autosave_latest.json'") + '&fields=files(id,name)';
+        var listRes = await gmFetch(listUrl, { method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken } });
+        var existingId = null;
+        if (listRes.status >= 200 && listRes.status < 300) {
+          var listData = JSON.parse(listRes.responseText);
+          if (listData.files && listData.files.length > 0) existingId = listData.files[0].id;
+        }
+
+        if (existingId) {
+          // Update existing file
+          var updateRes = await gmFetch(GDRIVE_CONFIG.UPLOAD_URL + '/' + existingId + '?uploadType=media', {
+            method: 'PATCH',
+            headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+            body: backupData
+          });
+          if (updateRes.status < 200 || updateRes.status >= 300) throw new Error('GDrive update failed: ' + updateRes.status);
+        } else {
+          fileName = 'wme_autosave_latest.json';
+          var boundary = '===ESM_AUTOSAVE===';
+          var metadata = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+          var multipartBody = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + metadata + '\r\n--' + boundary + '\r\nContent-Type: application/json\r\n\r\n' + backupData + '\r\n--' + boundary + '--';
+          var uploadRes = await gmFetch(GDRIVE_CONFIG.UPLOAD_URL + '?uploadType=multipart', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'multipart/related; boundary=' + boundary },
+            body: multipartBody
+          });
+          if (uploadRes.status < 200 || uploadRes.status >= 300) throw new Error('GDrive upload failed: ' + uploadRes.status);
+        }
+      } else {
+        var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        fileName = 'wme_autosave_' + timestamp + '.json';
+        var boundary2 = '===ESM_AUTOSAVE===';
+        var metadata2 = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+        var multipartBody2 = '--' + boundary2 + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + metadata2 + '\r\n--' + boundary2 + '\r\nContent-Type: application/json\r\n\r\n' + backupData + '\r\n--' + boundary2 + '--';
+        var uploadRes2 = await gmFetch(GDRIVE_CONFIG.UPLOAD_URL + '?uploadType=multipart', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'multipart/related; boundary=' + boundary2 },
+          body: multipartBody2
+        });
+        if (uploadRes2.status < 200 || uploadRes2.status >= 300) throw new Error('GDrive upload failed: ' + uploadRes2.status);
+        await cleanupOldGdriveBackups(accessToken, maxBackups);
+      }
+      ESM_DIAG.log('Auto Save GDrive done.');
+    }
+
+    // Shared backup data builder for auto-save
+    async function buildBackupData(backupType) {
       return {
-        meta: { exportedAt: new Date().toISOString(), origin: location.origin, scriptVersion },
-        localStorage: (() => {
-          const out = {};
+        meta: {
+          exportedAt: new Date().toISOString(),
+          origin: location.origin,
+          scriptVersion: scriptVersion,
+          backupType: backupType || 'autosave'
+        },
+        localStorage: (function() {
+          var out = {};
           try {
-            for (let i = 0; i < window.localStorage.length; i++) {
-              const k = NativeStorage.key.call(window.localStorage, i);
+            var len = window.localStorage.length;
+            for (var i = 0; i < len; i++) {
+              var k = NativeStorage.key.call(window.localStorage, i);
               if (k != null) out[k] = NativeStorage.getItem.call(window.localStorage, k);
             }
           } catch (e) {
-            Object.keys(window.localStorage).forEach(k => { try { out[k] = window.localStorage.getItem(k); } catch (_) {} });
+            Object.keys(window.localStorage).forEach(function(k) { try { out[k] = window.localStorage.getItem(k); } catch (_) { out[k] = null; } });
+          }
+          return out;
+        })(),
+        sessionStorage: (function() {
+          var out = {};
+          try {
+            var len = window.sessionStorage.length;
+            for (var i = 0; i < len; i++) {
+              var k = NativeStorage.key.call(window.sessionStorage, i);
+              if (k != null) out[k] = NativeStorage.getItem.call(window.sessionStorage, k);
+            }
+          } catch (e) {
+            Object.keys(window.sessionStorage).forEach(function(k) { try { out[k] = window.sessionStorage.getItem(k); } catch (_) { out[k] = null; } });
+          }
+          return out;
+        })(),
+        cookies: document.cookie.split(';').map(function(c) { var parts = c.trim().split('='); return { name: parts[0], value: parts.slice(1).join('=') }; }).filter(function(c) { return c.name; }),
+        indexedDB: await backupIndexedDB()
+      };
+    }
+
+    function loadAutoSaveSettings() {
+      var cb = document.getElementById('esm-autosave-cb');
+      var sel = document.getElementById('esm-autosave-interval');
+      var targetSel = document.getElementById('esm-autosave-target');
+      var slider = document.getElementById('esm-autosave-maxbackups');
+      var sliderVal = document.getElementById('esm-autosave-maxbackups-val');
+      try {
+        var savedInterval = localStorage.getItem(AUTO_SAVE_INTERVAL_KEY) || '300000';
+        if (sel) sel.value = savedInterval;
+        var savedTarget = localStorage.getItem(AUTO_SAVE_TARGET_KEY) || 'local';
+        if (targetSel) targetSel.value = savedTarget;
+        var savedMax = localStorage.getItem(AUTO_SAVE_MAX_BACKUPS_KEY) || '1';
+        if (slider) { slider.value = savedMax; }
+        if (sliderVal) { sliderVal.textContent = savedMax; }
+        var savedEnabled = localStorage.getItem(AUTO_SAVE_ENABLED_KEY) === '1';
+        if (cb) {
+          cb.checked = savedEnabled;
+          if (savedEnabled) toggleAutoSave();
+        }
+      } catch (_) {}
+    }
+
+    function createAutoSaveUI() {
+      var wrapper = document.createElement('div');
+      wrapper.id = 'esm-autosave-section';
+      wrapper.style.marginTop = '12px';
+      wrapper.style.padding = '10px 12px';
+      wrapper.style.background = '#f0f4ff';
+      wrapper.style.border = '1px solid #c5cae9';
+      wrapper.style.borderRadius = '10px';
+
+      var title = document.createElement('div');
+      title.textContent = t('autoSaveLabel');
+      title.style.fontWeight = '700';
+      title.style.fontSize = '13px';
+      title.style.marginBottom = '8px';
+      wrapper.appendChild(title);
+
+      var cbLabel = document.createElement('label');
+      cbLabel.style.display = 'flex';
+      cbLabel.style.alignItems = 'center';
+      cbLabel.style.gap = '6px';
+      cbLabel.style.fontSize = '12px';
+      cbLabel.style.cursor = 'pointer';
+      cbLabel.style.marginBottom = '8px';
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = 'esm-autosave-cb';
+      cb.addEventListener('change', toggleAutoSave);
+      cbLabel.appendChild(cb);
+      cbLabel.appendChild(document.createTextNode(t('autoSaveEnable')));
+      wrapper.appendChild(cbLabel);
+
+      var row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '10px';
+      row.style.alignItems = 'center';
+      row.style.flexWrap = 'wrap';
+
+      var intLabel = document.createElement('label');
+      intLabel.textContent = t('autoSaveInterval');
+      intLabel.style.fontSize = '12px';
+      intLabel.style.fontWeight = '500';
+      row.appendChild(intLabel);
+
+      var sel = document.createElement('select');
+      sel.id = 'esm-autosave-interval';
+      sel.disabled = true;
+      sel.style.padding = '4px 6px';
+      sel.style.border = '1px solid #bbb';
+      sel.style.borderRadius = '6px';
+      sel.style.fontSize = '12px';
+      var intervals = [['300000','5 min'],['600000','10 min'],['900000','15 min'],['1800000','30 min'],['3600000','1 h']];
+      intervals.forEach(function(iv) {
+        var opt = document.createElement('option');
+        opt.value = iv[0];
+        opt.textContent = iv[1];
+        sel.appendChild(opt);
+      });
+      sel.addEventListener('change', onAutoSaveIntervalChange);
+      row.appendChild(sel);
+
+      var tgtLabel = document.createElement('label');
+      tgtLabel.textContent = t('autoSaveTarget');
+      tgtLabel.style.fontSize = '12px';
+      tgtLabel.style.fontWeight = '500';
+      row.appendChild(tgtLabel);
+
+      var tgtSel = document.createElement('select');
+      tgtSel.id = 'esm-autosave-target';
+      tgtSel.style.padding = '4px 6px';
+      tgtSel.style.border = '1px solid #bbb';
+      tgtSel.style.borderRadius = '6px';
+      tgtSel.style.fontSize = '12px';
+      var targets = [['local', t('autoSaveTargetLocal')],['dropbox', t('autoSaveTargetDropbox')],['gdrive', t('autoSaveTargetGdrive')]];
+      targets.forEach(function(tg) {
+        var opt = document.createElement('option');
+        opt.value = tg[0];
+        opt.textContent = tg[1];
+        tgtSel.appendChild(opt);
+      });
+      tgtSel.addEventListener('change', onAutoSaveTargetChange);
+      row.appendChild(tgtSel);
+
+      wrapper.appendChild(row);
+
+      // Slider für max. Backups
+      var sliderRow = document.createElement('div');
+      sliderRow.style.display = 'flex';
+      sliderRow.style.gap = '8px';
+      sliderRow.style.alignItems = 'center';
+      sliderRow.style.marginTop = '10px';
+
+      var sliderLabel = document.createElement('label');
+      sliderLabel.textContent = t('autoSaveMaxBackups');
+      sliderLabel.style.fontSize = '12px';
+      sliderLabel.style.fontWeight = '500';
+      sliderLabel.style.minWidth = '55px';
+      sliderRow.appendChild(sliderLabel);
+
+      var hintLeft = document.createElement('span');
+      hintLeft.textContent = t('autoSaveMaxBackupsHint1');
+      hintLeft.style.fontSize = '10px';
+      hintLeft.style.color = '#888';
+      hintLeft.style.whiteSpace = 'nowrap';
+      sliderRow.appendChild(hintLeft);
+
+      var slider = document.createElement('input');
+      slider.type = 'range';
+      slider.id = 'esm-autosave-maxbackups';
+      slider.min = '1';
+      slider.max = '10';
+      slider.value = '1';
+      slider.style.flex = '1';
+      slider.style.cursor = 'pointer';
+      slider.style.accentColor = '#3f51b5';
+      sliderRow.appendChild(slider);
+
+      var hintRight = document.createElement('span');
+      hintRight.textContent = t('autoSaveMaxBackupsHint10');
+      hintRight.style.fontSize = '10px';
+      hintRight.style.color = '#888';
+      hintRight.style.whiteSpace = 'nowrap';
+      sliderRow.appendChild(hintRight);
+
+      var sliderVal = document.createElement('span');
+      sliderVal.id = 'esm-autosave-maxbackups-val';
+      sliderVal.textContent = '1';
+      sliderVal.style.fontSize = '13px';
+      sliderVal.style.fontWeight = '700';
+      sliderVal.style.minWidth = '20px';
+      sliderVal.style.textAlign = 'center';
+      sliderRow.appendChild(sliderVal);
+
+      slider.addEventListener('input', function() {
+        sliderVal.textContent = slider.value;
+        try { localStorage.setItem(AUTO_SAVE_MAX_BACKUPS_KEY, slider.value); } catch (_) {}
+      });
+
+      wrapper.appendChild(sliderRow);
+
+      return wrapper;
+    }
+
+    async function exportLocalStorage() {
+      const backup = {
+        meta: {
+          exportedAt: new Date().toISOString(),
+          origin: location.origin,
+          scriptVersion
+        },
+        // Robust: Determine keys and read values ​​via the native storage API
+        localStorage: (() => {
+          const out = {};
+          try {
+            const len = window.localStorage.length;
+            for (let i = 0; i < len; i++) {
+              const k = NativeStorage.key.call(window.localStorage, i);
+              if (k != null) {
+                out[k] = NativeStorage.getItem.call(window.localStorage, k);
+              }
+            }
+          } catch (e) {
+            // Fallback if another script has patched key()/getItem
+            Object.keys(window.localStorage).forEach(k => {
+              try { out[k] = window.localStorage.getItem(k); } catch (_) { out[k] = null; }
+            });
           }
           return out;
         })(),
         sessionStorage: (() => {
           const out = {};
           try {
-            for (let i = 0; i < window.sessionStorage.length; i++) {
+            const len = window.sessionStorage.length;
+            for (let i = 0; i < len; i++) {
               const k = NativeStorage.key.call(window.sessionStorage, i);
-              if (k != null) out[k] = NativeStorage.getItem.call(window.sessionStorage, k);
+              if (k != null) {
+                out[k] = NativeStorage.getItem.call(window.sessionStorage, k);
+              }
             }
           } catch (e) {
-            Object.keys(window.sessionStorage).forEach(k => { try { out[k] = window.sessionStorage.getItem(k); } catch (_) {} });
+            Object.keys(window.sessionStorage).forEach(k => {
+              try { out[k] = window.sessionStorage.getItem(k); } catch (_) { out[k] = null; }
+            });
           }
           return out;
         })(),
-        cookies: document.cookie.split(';').map(c => {
-          const [name, ...rest] = c.trim().split('=');
-          return { name, value: rest.join('=') };
-        }).filter(c => c.name),
+        cookies: document.cookie
+          .split(';')
+          .map(c => {
+            const [name, ...rest] = c.trim().split('=');
+            return { name, value: rest.join('=') };
+          })
+          .filter(c => c.name),
         indexedDB: await backupIndexedDB()
       };
-    }
-
-    async function exportLocalStorage() {
-      const backup = await generateFullBackup();
       const data = JSON.stringify(backup, null, 2);
       const file = new Blob([data], { type: 'application/json' });
       const a = document.createElement('a');
@@ -713,31 +2249,7 @@
       a.click();
     }
 
-    function processParsedBackup(parsed) {
-      let keyValuePairs = [];
-      const originOk = !(parsed && parsed.meta && parsed.meta.origin) || parsed.meta.origin === location.origin;
-      if (parsed && typeof parsed === 'object' && (parsed.localStorage || parsed.sessionStorage || parsed.cookies || parsed.indexedDB)) {
-        if (parsed.localStorage) Object.entries(parsed.localStorage).forEach(([k, v]) => keyValuePairs.push([`localStorage:${k}`, v]));
-        if (parsed.sessionStorage && originOk) Object.entries(parsed.sessionStorage).forEach(([k, v]) => keyValuePairs.push([`sessionStorage:${k}`, v]));
-        if (Array.isArray(parsed.cookies) && originOk) parsed.cookies.forEach(c => { if(c && c.name != null) keyValuePairs.push([`cookie:${c.name}`, c.value || '']); });
-        if (Array.isArray(parsed.indexedDB)) {
-          parsed.indexedDB.forEach(db => {
-            if (!db.name || !Array.isArray(db.stores)) return;
-            db.stores.forEach(st => {
-              if (!st.name || !Array.isArray(st.entries)) return;
-              st.entries.forEach(e => {
-                const keyLabel = `indexedDB:${db.name}/${st.name}:${JSON.stringify(e.key)}`;
-                keyValuePairs.push([keyLabel, { db: db.name, store: st.name, key: e.key, value: e.value, keyPath: st.keyPath, autoIncrement: !!st.autoIncrement, indexes: st.indexes || [] }]);
-              });
-            });
-          });
-        }
-      } else {
-        keyValuePairs = Object.entries(parsed);
-      }
-      return keyValuePairs;
-    }
-
+    // Import local storage data from a JSON file
     function importLocalStorage() {
       const input = document.createElement('input');
       input.type = 'file';
@@ -749,326 +2261,1249 @@
           try {
             const parsed = JSON.parse(reader.result);
             importedData = parsed;
-            const pairs = processParsedBackup(parsed);
-            displayKeyList(pairs);
+            let keyValuePairs = [];
+            const originOk = !(parsed && parsed.meta && parsed.meta.origin) || parsed.meta.origin === location.origin;
+            if (parsed && typeof parsed === 'object' && (parsed.localStorage || parsed.sessionStorage || parsed.cookies || parsed.indexedDB)) {
+              if (parsed.localStorage) {
+                for (const [k, v] of Object.entries(parsed.localStorage)) {
+                  keyValuePairs.push([`localStorage:${k}`, v]);
+                }
+              }
+              if (parsed.sessionStorage && originOk) {
+                for (const [k, v] of Object.entries(parsed.sessionStorage)) {
+                  keyValuePairs.push([`sessionStorage:${k}`, v]);
+                }
+              }
+              if (Array.isArray(parsed.cookies) && originOk) {
+                for (const c of parsed.cookies) {
+                  if (c && c.name != null) {
+                    keyValuePairs.push([`cookie:${c.name}`, (c && typeof c.value !== 'undefined' && c.value !== null) ? c.value : '']);
+                  }
+                }
+              }
+              if (Array.isArray(parsed.indexedDB)) {
+                for (const dbBackup of parsed.indexedDB) {
+                  const dbName = (dbBackup && dbBackup.name) ? dbBackup.name : undefined;
+                  if (!dbName || !Array.isArray(dbBackup.stores)) continue;
+                  for (const storeBackup of dbBackup.stores) {
+                    const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
+                    if (!storeName || !Array.isArray(storeBackup.entries)) continue;
+                    for (const entry of storeBackup.entries) {
+                      const keyStr = JSON.stringify(entry.key);
+                      const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
+                      const valueObj = {
+                        db: dbName,
+                        store: storeName,
+                        key: entry.key,
+                        value: entry.value,
+                        keyPath: (storeBackup && typeof storeBackup.keyPath !== 'undefined') ? storeBackup.keyPath : null,
+                        autoIncrement: !!storeBackup.autoIncrement,
+                        indexes: Array.isArray(storeBackup.indexes) ? storeBackup.indexes : []
+                      };
+                      keyValuePairs.push([keyLabel, valueObj]);
+                    }
+                  }
+                }
+              }
+            } else {
+              keyValuePairs = Object.entries(parsed);
+            }
+            displayKeyList(keyValuePairs);
             if (applyButton) applyButton.style.display = 'block';
-            currentWindow.alert(t('fileReadSuccess'));
-          } catch (error) { currentWindow.alert(t('invalidJson')); }
+            if (!originOk) {
+              alert(t('foreignBackupHint'));
+            } else {
+              alert(t('fileReadSuccess'));
+            }
+          } catch (error) {
+            // Only display the error message if the import fails
+            console.error(error);
+            alert(t('invalidJson'));
+          };
+        };
+        reader.onerror = function () {
+          alert(t('fileReadError'));
         };
         reader.readAsText(file);
       };
       input.click();
     }
 
+    // Display the list of keys for selection
     function displayKeyList(keyValuePairs) {
       const container = document.getElementById('key-list-container');
-      container.innerHTML = '';
-      const sAll = document.createElement('button'); sAll.textContent = t('selectAll');
-      sAll.addEventListener('click', () => container.querySelectorAll('input[type="checkbox"]').forEach(c => c.checked = true));
-      container.appendChild(sAll);
-      const dAll = document.createElement('button'); dAll.textContent = t('deselectAll');
-      dAll.addEventListener('click', () => container.querySelectorAll('input[type="checkbox"]').forEach(c => c.checked = false));
-      container.appendChild(dAll);
+      container.innerHTML = ''; // Clear existing list
+
+      // Select All button
+      const selectAllButton = document.createElement('button');
+    selectAllButton.textContent = t('selectAll');
+      selectAllButton.addEventListener('click', function () {
+        const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+        checkboxes.forEach((checkbox) => {
+          checkbox.checked = true;
+        });
+      });
+      container.appendChild(selectAllButton);
+
+      // Deselect All button
+      const deselectAllButton = document.createElement('button');
+    deselectAllButton.textContent = t('deselectAll');
+      deselectAllButton.addEventListener('click', function () {
+        const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+        checkboxes.forEach((checkbox) => {
+          checkbox.checked = false;
+        });
+      });
+      container.appendChild(deselectAllButton);
+
       container.appendChild(document.createElement('br'));
 
+      // Key checkboxes
       keyValuePairs.forEach(([key, value]) => {
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
-        checkbox.id = key; checkbox.value = key; checkbox.checked = true;
+        checkbox.id = key;
+        checkbox.value = key;
+        checkbox.checked = true;
         container.appendChild(checkbox);
+
         const label = document.createElement('label');
-        label.htmlFor = key; label.textContent = key;
+        label.htmlFor = key;
+        label.textContent = key;
         container.appendChild(label);
-        const hv = document.createElement('input');
-        hv.type = 'hidden'; hv.value = typeof value === 'string' ? value : JSON.stringify(value);
-        container.appendChild(hv);
+
+        const hiddenValue = document.createElement('input');
+        hiddenValue.type = 'hidden';
+        hiddenValue.value = typeof value === 'string' ? value : JSON.stringify(value);
+        container.appendChild(hiddenValue);
+
         container.appendChild(document.createElement('br'));
       });
 
+      // Apply button
       applyButton = document.createElement('button');
-      applyButton.textContent = t('apply');
+    applyButton.textContent = t('apply');
       applyButton.addEventListener('click', applyImport);
       container.appendChild(applyButton);
     }
 
+    // Apply the selected key-value pairs from the JSON file
     async function applyImport() {
-      const selectedPairs = [];
-      document.querySelectorAll('#key-list-container input[type="checkbox"]').forEach(c => {
-        if (c.checked) {
-          const vStr = c.nextElementSibling.nextElementSibling.value;
-          selectedPairs.push([c.value, c.value.startsWith('indexedDB:') ? JSON.parse(vStr) : vStr]);
-        }
-      });
-      if (selectedPairs.length === 0) { currentWindow.alert(t('noKeysSelected')); return; }
+      const selectedPairs = getSelectedPairs();
+      if (selectedPairs.length === 0) {
+        alert('No keys selected. Nothing to import.');
+        return;
+      }
+
       const { counts, failures } = await applyPairs(selectedPairs);
-      const summary = `Import Completed\n- local: ${counts.local}\n- session: ${counts.session}\n- cookie: ${counts.cookie}\n- idb: ${counts.idb}`;
-      currentWindow.alert(summary);
-      if (currentWindow.confirm('Success. Refresh page?')) {
-        try { sessionStorage.setItem(REAPPLY_STASH_KEY, JSON.stringify({ origin: location.origin, items: selectedPairs })); } catch (e) {}
+
+      const summary = `Import Completed\n- localStorage: ${counts.local}\n- sessionStorage: ${counts.session}\n- Cookies: ${counts.cookie}\n- IndexedDB: ${counts.idb}` + (failures.length ? `\n\nError (first ${Math.min(5, failures.length)}):\n${failures.slice(0,5).join('\n')}${failures.length > 5 ? `\n... (${failures.length - 5} more)` : ''}` : '');
+      alert(summary);
+
+      // Prompt to refresh the page
+      if (confirm('The import was successful. Press ok to refresh page.')) {
+        try {
+          // Stash for post-reload reapply to prevent other scripts from overwriting restored values during startup
+          sessionStorage.setItem(REAPPLY_STASH_KEY, JSON.stringify({ origin: location.origin, items: selectedPairs }));
+        } catch (e) {
+          // ignore stash errors
+        }
         location.reload();
       }
     }
 
+    // Get the selected key-value pairs
+    function getSelectedPairs() {
+      const checkboxes = document.querySelectorAll('#key-list-container input[type="checkbox"]');
+      const selectedPairs = [];
+      checkboxes.forEach((checkbox) => {
+        if (checkbox.checked) {
+          const key = checkbox.value;
+          const valueStr = checkbox.nextElementSibling.nextElementSibling.value;
+          // For IndexedDB entries, the value is JSON-encoded; for all other storages, the string must remain unchanged
+          if (key.startsWith('indexedDB:')) {
+            let parsedValue;
+            try {
+              parsedValue = JSON.parse(valueStr);
+            } catch (e) {
+              parsedValue = valueStr; // Fallback in case something unexpected happens
+            }
+            selectedPairs.push([key, parsedValue]);
+          } else {
+            selectedPairs.push([key, valueStr]);
+          }
+        }
+      });
+      return selectedPairs;
+    }
+
+    // Helper to apply selected pairs across storage types and IndexedDB (inside IIFE)
     async function applyPairs(selectedPairs) {
       const counts = { local: 0, session: 0, cookie: 0, idb: 0 };
       const failures = [];
-      const sameOrigin = !importedData || !importedData.meta || !importedData.meta.origin || importedData.meta.origin === location.origin;
+      const sourceOrigin = (importedData && importedData.meta && importedData.meta.origin) ? importedData.meta.origin : undefined;
+      const sameOrigin = !sourceOrigin || sourceOrigin === location.origin;
 
       for (const [fullKey, value] of selectedPairs) {
         try {
           const colonIdx = fullKey.indexOf(':');
-          const type = colonIdx < 0 ? 'localStorage' : fullKey.slice(0, colonIdx);
-          const rest = colonIdx < 0 ? fullKey : fullKey.slice(colonIdx + 1);
+          if (colonIdx < 0) {
+            // Fallback: without type prefix we treat it as localStorage
+            localStorage.setItem(fullKey, value);
+            counts.local++;
+            continue;
+          }
+          const type = fullKey.slice(0, colonIdx);
+          const rest = fullKey.slice(colonIdx + 1);
 
           if (type === 'localStorage') {
-            try { NativeStorage.setItem.call(window.localStorage, rest, value); } catch (_) { window.localStorage.setItem(rest, value); }
+            try {
+              NativeStorage.setItem.call(window.localStorage, rest, value);
+            } catch (_) {
+              window.localStorage.setItem(rest, value);
+            }
             counts.local++;
           } else if (type === 'sessionStorage') {
-            if (sameOrigin) {
-              try { NativeStorage.setItem.call(window.sessionStorage, rest, value); } catch (_) { window.sessionStorage.setItem(rest, value); }
+            if (!sameOrigin) {
+              failures.push(`sessionStorage:${rest} skipped (Origin differs)`);
+            } else {
+              try {
+                NativeStorage.setItem.call(window.sessionStorage, rest, value);
+              } catch (_) {
+                window.sessionStorage.setItem(rest, value);
+              }
               counts.session++;
             }
           } else if (type === 'cookie') {
-            if (sameOrigin) {
+            if (!sameOrigin) {
+              failures.push(`cookie:${rest} skipped (Origin differs)`);
+            } else {
+              // Set a session cookie (root path). An expiration date can be added if necessary.
               document.cookie = `${rest}=${value}; path=/`;
               counts.cookie++;
             }
           } else if (type === 'indexedDB') {
-            await writeIndexedDBRecord(value);
-            counts.idb++;
+            try {
+              // The value is already a complete record object (db, store, key, value, keyPath, autoIncrement, indexes)
+              await writeIndexedDBRecord(value);
+              counts.idb++;
+            } catch (e) {
+              failures.push(`indexedDB:${rest} -> ${e && e.message ? e.message : e}`);
+            }
+          } else {
+            // Unknown type: treat as localStorage
+            localStorage.setItem(rest, value);
+            counts.local++;
           }
-        } catch (err) { failures.push(`${fullKey} -> ${err.message}`); }
+        } catch (err) {
+          failures.push(`${fullKey} -> ${err && err.message ? err.message : err}`);
+        }
       }
+
       return { counts, failures };
     }
 
-    function setupUIElements(container, isWUserscripts = false) {
-      const title = document.createElement('p');
-      title.style.fontWeight = 'bold';
-      title.textContent = t('scriptTitle');
-      container.appendChild(title);
-
-      const desc = document.createElement('p');
-      desc.textContent = t('importExportDesc');
-      container.appendChild(desc);
-
-      const btnRow1 = document.createElement('div');
-      btnRow1.style.display = 'flex';
-      btnRow1.style.gap = '8px';
-      btnRow1.style.marginTop = '8px';
-
-      const expBtn = document.createElement('button');
-      expBtn.id = 'esm-export';
-      expBtn.textContent = t('exportBackup');
-      expBtn.title = t('exportBackupTitle');
-      expBtn.style.backgroundImage = 'linear-gradient(180deg, #43a047, #2e7d32)';
-      expBtn.style.color = '#fff';
-      expBtn.style.border = 'none';
-      expBtn.style.borderRadius = '10px';
-      expBtn.style.padding = '8px 12px';
-      expBtn.style.cursor = 'pointer';
-      // ... more styles from update script ...
-      expBtn.addEventListener('click', () => exportLocalStorage());
-
-      const impBtn = document.createElement('button');
-      impBtn.id = 'esm-import';
-      impBtn.textContent = t('importBackup');
-      impBtn.title = t('importBackupTitle');
-      impBtn.style.backgroundImage = 'linear-gradient(180deg, #2196f3, #1976d2)';
-      impBtn.style.color = '#fff';
-      impBtn.style.border = 'none';
-      impBtn.style.borderRadius = '10px';
-      impBtn.style.padding = '8px 12px';
-      impBtn.style.cursor = 'pointer';
-      impBtn.addEventListener('click', () => importLocalStorage());
-
-      btnRow1.appendChild(expBtn);
-      btnRow1.appendChild(impBtn);
-      container.appendChild(btnRow1);
-
-      const btnRow2 = document.createElement('div');
-      btnRow2.style.display = 'flex';
-      btnRow2.style.gap = '8px';
-      btnRow2.style.marginTop = '8px';
-
-      const cExpBtn = document.createElement('button');
-      cExpBtn.id = 'esm-cloud-backup';
-      cExpBtn.textContent = t('cloudBackup');
-      cExpBtn.title = t('cloudBackupTitle');
-      cExpBtn.style.backgroundImage = 'linear-gradient(180deg, #ff9800, #f57c00)';
-      cExpBtn.style.color = '#fff';
-      cExpBtn.style.border = 'none';
-      cExpBtn.style.borderRadius = '10px';
-      cExpBtn.style.padding = '8px 12px';
-      cExpBtn.style.cursor = 'pointer';
-      cExpBtn.addEventListener('click', () => exportToDropbox());
-
-      const cImpBtn = document.createElement('button');
-      cImpBtn.id = 'esm-cloud-restore';
-      cImpBtn.textContent = t('cloudRestore');
-      cImpBtn.title = t('cloudRestoreTitle');
-      cImpBtn.style.backgroundImage = 'linear-gradient(180deg, #9c27b0, #7b1fa2)';
-      cImpBtn.style.color = '#fff';
-      cImpBtn.style.border = 'none';
-      cImpBtn.style.borderRadius = '10px';
-      cImpBtn.style.padding = '8px 12px';
-      cImpBtn.style.cursor = 'pointer';
-      cImpBtn.addEventListener('click', () => importFromDropbox());
-
-      btnRow2.appendChild(cExpBtn);
-      btnRow2.appendChild(cImpBtn);
-      container.appendChild(btnRow2);
-
-      injectDropboxHelpPanel(container);
-
-      const klc = document.createElement('div');
-      klc.id = 'key-list-container';
-      klc.style.marginTop = '10px';
-      klc.style.border = '1px solid rgba(0,0,0,0.1)';
-      klc.style.borderRadius = '8px';
-      klc.style.padding = '8px';
-      klc.style.maxHeight = '320px';
-      klc.style.overflow = 'auto';
-      container.appendChild(klc);
-    }
-
-    async function addScriptTab() {
-      if (currentWindow.uiMounted) return;
-
-      if (typeof currentWindow.getWmeSdk === 'function') {
-        try {
-          const sdk = currentWindow.getWmeSdk({ scriptId: "easy-storage-manager", scriptName: "Easy Storage Manager" });
-          const { tabLabel, tabPane } = await sdk.Sidebar.registerScriptTab();
-          tabLabel.innerText = '💾';
-          tabLabel.title = t('scriptTitle');
-          setupUIElements(tabPane, true);
-          currentWindow.uiMounted = true;
-          return;
-        } catch (e) { ESM_DIAG.error('SDK Tab failed', e); }
-      }
-
-      if (typeof W !== 'undefined' && W && W.userscripts && typeof W.userscripts.registerSidebarTab === 'function') {
-        try {
-          const { tabLabel, tabPane } = W.userscripts.registerSidebarTab('easy-storage-manager-tab');
-          tabLabel.innerText = '💾';
-          tabLabel.title = t('scriptTitle');
-          setupUIElements(tabPane, true);
-          currentWindow.uiMounted = true;
-          return;
-        } catch (e) { ESM_DIAG.error('W.userscripts fallback failed', e); }
-      }
-
-      if (typeof WazeWrap !== 'undefined' && WazeWrap.Interface && typeof WazeWrap.Interface.Tab === 'function') {
-        const div = document.createElement('div');
-        div.id = 'esm-tab';
-        setupUIElements(div);
-        new WazeWrap.Interface.Tab(t('scriptTitle'), div.outerHTML, () => {
-          // Re-bind listeners because outerHTML loses them
-          const container = document.getElementById('esm-tab');
-          container.querySelector('#esm-export').addEventListener('click', () => exportLocalStorage());
-          container.querySelector('#esm-import').addEventListener('click', () => importLocalStorage());
-          container.querySelector('#esm-cloud-backup').addEventListener('click', () => exportToDropbox());
-          container.querySelector('#esm-cloud-restore').addEventListener('click', () => importFromDropbox());
-          injectDropboxHelpPanel(container);
-        });
-        currentWindow.uiMounted = true;
+    // Create and add the tab for the script (robust multi-path)
+    function addScriptTab() {
+      if (typeof window !== 'undefined' && window.uiMounted) {
+        ESM_DIAG.log('UI already mounted, skipping addScriptTab');
         return;
       }
 
+      const haveWUserscripts = typeof W !== 'undefined' && W && W.userscripts && typeof W.userscripts.registerSidebarTab === 'function';
+      const haveWazeWrapTab = typeof WazeWrap !== 'undefined' && WazeWrap && WazeWrap.Interface && typeof WazeWrap.Interface.Tab === 'function';
+
+      if (haveWUserscripts) {
+        try {
+          const scriptId = 'easy-storage-manager-tab';
+          const { tabLabel, tabPane } = W.userscripts.registerSidebarTab(scriptId);
+
+          tabLabel.innerText = '💾';
+          tabLabel.title = t('scriptTitle');
+
+          const description = document.createElement('p');
+          description.style.fontWeight = 'bold';
+    description.textContent = t('scriptTitle');
+          tabPane.appendChild(description);
+
+const text = document.createElement('p');
+text.textContent = t('importExportDesc');
+          tabPane.appendChild(text);
+
+const importButton = document.createElement('button');
+importButton.textContent = t('importBackup');
+importButton.title = t('importBackupTitle');
+          importButton.addEventListener('click', function() {
+            if (typeof window.importLocalStorage === 'function') {
+              window.importLocalStorage();
+            } else if (typeof importLocalStorage === 'function') {
+              importLocalStorage();
+            } else {
+              try { if (window.ESM_DIAG) window.ESM_DIAG.error('Import function not available'); } catch (_) {}
+              alert('Import function not available');
+            }
+          });
+    // keep title already set
+          importButton.style.backgroundImage = 'linear-gradient(180deg, #2196f3, #1976d2)';
+          importButton.style.color = '#fff';
+          importButton.style.border = 'none';
+          importButton.style.borderRadius = '10px';
+          importButton.style.padding = '8px 12px';
+          importButton.style.fontWeight = '600';
+          importButton.style.cursor = 'pointer';
+          importButton.style.boxShadow = '0 3px 8px rgba(25, 118, 210, 0.35)';
+          importButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          importButton.style.whiteSpace = 'nowrap';
+          importButton.style.display = 'inline-flex';
+          importButton.style.alignItems = 'center';
+          importButton.style.flex = '0 0 auto';
+          importButton.style.gap = '4px';
+          importButton.style.fontSize = '13px';
+          importButton.style.lineHeight = '18px';
+          importButton.style.width = 'auto';
+          importButton.addEventListener('mouseenter', () => { importButton.style.filter = 'brightness(1.08)'; importButton.style.boxShadow = '0 6px 14px rgba(25,118,210,0.45)'; });
+          importButton.addEventListener('mouseleave', () => { importButton.style.filter = ''; importButton.style.boxShadow = '0 3px 8px rgba(25,118,210,0.35)'; });
+
+const exportButton = document.createElement('button');
+exportButton.textContent = t('exportBackup');
+exportButton.title = t('exportBackupTitle');
+          exportButton.addEventListener('click', function() {
+            if (typeof window.exportLocalStorage === 'function') {
+              window.exportLocalStorage();
+            } else if (typeof exportLocalStorage === 'function') {
+              exportLocalStorage();
+            } else {
+              try { if (window.ESM_DIAG) window.ESM_DIAG.error('Export function not available'); } catch (_) {}
+              alert('Export function not available');
+            }
+          });
+    // keep title already set
+          exportButton.style.backgroundImage = 'linear-gradient(180deg, #43a047, #2e7d32)';
+          exportButton.style.color = '#fff';
+          exportButton.style.border = 'none';
+          exportButton.style.borderRadius = '10px';
+          exportButton.style.padding = '8px 12px';
+          exportButton.style.fontWeight = '600';
+          exportButton.style.cursor = 'pointer';
+          exportButton.style.boxShadow = '0 3px 8px rgba(46, 125, 50, 0.35)';
+          exportButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          exportButton.style.whiteSpace = 'nowrap';
+          exportButton.style.display = 'inline-flex';
+          exportButton.style.alignItems = 'center';
+          exportButton.style.flex = '0 0 auto';
+          exportButton.style.gap = '4px';
+          exportButton.style.fontSize = '13px';
+          exportButton.style.lineHeight = '18px';
+          exportButton.style.width = 'auto';
+          exportButton.addEventListener('mouseenter', () => { exportButton.style.filter = 'brightness(1.08)'; exportButton.style.boxShadow = '0 6px 14px rgba(46,125,50,0.45)'; });
+          exportButton.addEventListener('mouseleave', () => { exportButton.style.filter = ''; exportButton.style.boxShadow = '0 3px 8px rgba(46,125,50,0.35)'; });
+
+          const buttonContainer = document.createElement('div');
+          buttonContainer.style.display = 'flex';
+          buttonContainer.style.gap = '8px';
+          buttonContainer.style.marginTop = '8px';
+          buttonContainer.style.justifyContent = 'center';
+          buttonContainer.style.alignItems = 'center';
+          buttonContainer.style.width = '100%';
+          // Reihenfolge: zuerst Lokal Speichern (Export), dann Wiederherstellen (Import)
+          exportButton.style.order = '1';
+          importButton.style.order = '2';
+          buttonContainer.appendChild(exportButton);
+          buttonContainer.appendChild(importButton);
+          tabPane.appendChild(buttonContainer);
+
+          // Dropbox Cloud Backup Buttons
+const cloudBackupButton = document.createElement('button');
+cloudBackupButton.textContent = t('cloudBackup');
+cloudBackupButton.title = t('cloudBackupTitle');
+          cloudBackupButton.addEventListener('click', function() {
+            if (typeof exportToDropbox === 'function') {
+          exportToDropbox();
+            } else {
+try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox export function not available'); } catch (_) {}
+alert(t('dropboxExportUnavailable'));
+            }
+          });
+    // title already set
+          cloudBackupButton.style.backgroundImage = 'linear-gradient(180deg, #ff9800, #f57c00)';
+          cloudBackupButton.style.color = '#fff';
+          cloudBackupButton.style.border = 'none';
+          cloudBackupButton.style.borderRadius = '10px';
+          cloudBackupButton.style.padding = '8px 12px';
+          cloudBackupButton.style.fontWeight = '600';
+          cloudBackupButton.style.cursor = 'pointer';
+          cloudBackupButton.style.boxShadow = '0 3px 8px rgba(245, 124, 0, 0.35)';
+          cloudBackupButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          cloudBackupButton.style.whiteSpace = 'nowrap';
+          cloudBackupButton.style.display = 'inline-flex';
+          cloudBackupButton.style.alignItems = 'center';
+          cloudBackupButton.style.flex = '0 0 auto';
+          cloudBackupButton.style.gap = '4px';
+          cloudBackupButton.style.fontSize = '13px';
+          cloudBackupButton.style.lineHeight = '18px';
+          cloudBackupButton.style.width = 'auto';
+          cloudBackupButton.addEventListener('mouseenter', () => { cloudBackupButton.style.filter = 'brightness(1.08)'; cloudBackupButton.style.boxShadow = '0 6px 14px rgba(245,124,0,0.45)'; });
+          cloudBackupButton.addEventListener('mouseleave', () => { cloudBackupButton.style.filter = ''; cloudBackupButton.style.boxShadow = '0 3px 8px rgba(245,124,0,0.35)'; });
+
+const cloudRestoreButton = document.createElement('button');
+cloudRestoreButton.textContent = t('cloudRestore');
+cloudRestoreButton.title = t('cloudRestoreTitle');
+          cloudRestoreButton.addEventListener('click', function() {
+            if (typeof importFromDropbox === 'function') {
+          importFromDropbox();
+            } else {
+try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox restore function not available'); } catch (_) {}
+alert(t('dropboxImportUnavailable'));
+            }
+          });
+    // title already set
+          cloudRestoreButton.style.backgroundImage = 'linear-gradient(180deg, #9c27b0, #7b1fa2)';
+          cloudRestoreButton.style.color = '#fff';
+          cloudRestoreButton.style.border = 'none';
+          cloudRestoreButton.style.borderRadius = '10px';
+          cloudRestoreButton.style.padding = '8px 12px';
+          cloudRestoreButton.style.fontWeight = '600';
+          cloudRestoreButton.style.cursor = 'pointer';
+          cloudRestoreButton.style.boxShadow = '0 3px 8px rgba(123, 31, 162, 0.35)';
+          cloudRestoreButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          cloudRestoreButton.style.whiteSpace = 'nowrap';
+          cloudRestoreButton.style.display = 'inline-flex';
+          cloudRestoreButton.style.alignItems = 'center';
+          cloudRestoreButton.style.flex = '0 0 auto';
+          cloudRestoreButton.style.gap = '4px';
+          cloudRestoreButton.style.fontSize = '13px';
+          cloudRestoreButton.style.lineHeight = '18px';
+          cloudRestoreButton.style.width = 'auto';
+          cloudRestoreButton.addEventListener('mouseenter', () => { cloudRestoreButton.style.filter = 'brightness(1.08)'; cloudRestoreButton.style.boxShadow = '0 6px 14px rgba(123,31,162,0.45)'; });
+          cloudRestoreButton.addEventListener('mouseleave', () => { cloudRestoreButton.style.filter = ''; cloudRestoreButton.style.boxShadow = '0 3px 8px rgba(123,31,162,0.35)'; });
+
+          const cloudButtonContainer = document.createElement('div');
+          cloudButtonContainer.style.display = 'flex';
+          cloudButtonContainer.style.gap = '8px';
+          cloudButtonContainer.style.marginTop = '8px';
+          cloudButtonContainer.style.justifyContent = 'center';
+          cloudButtonContainer.style.alignItems = 'center';
+          cloudButtonContainer.style.width = '100%';
+          cloudButtonContainer.appendChild(cloudBackupButton);
+          cloudButtonContainer.appendChild(cloudRestoreButton);
+          tabPane.appendChild(cloudButtonContainer);
+
+          // Google Drive Backup Buttons
+          const gdriveBackupButton = document.createElement('button');
+          gdriveBackupButton.textContent = t('gdriveBackup');
+          gdriveBackupButton.title = t('gdriveBackupTitle');
+          gdriveBackupButton.addEventListener('click', function() {
+            if (typeof exportToGoogleDrive === 'function') { exportToGoogleDrive(); }
+            else { alert(t('gdriveExportUnavailable')); }
+          });
+          gdriveBackupButton.style.backgroundImage = 'linear-gradient(180deg, #4285f4, #1a73e8)';
+          gdriveBackupButton.style.color = '#fff'; gdriveBackupButton.style.border = 'none'; gdriveBackupButton.style.borderRadius = '10px';
+          gdriveBackupButton.style.padding = '8px 12px'; gdriveBackupButton.style.fontWeight = '600'; gdriveBackupButton.style.cursor = 'pointer';
+          gdriveBackupButton.style.boxShadow = '0 3px 8px rgba(26, 115, 232, 0.35)';
+          gdriveBackupButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          gdriveBackupButton.style.whiteSpace = 'nowrap'; gdriveBackupButton.style.display = 'inline-flex'; gdriveBackupButton.style.alignItems = 'center';
+          gdriveBackupButton.style.flex = '0 0 auto'; gdriveBackupButton.style.gap = '4px'; gdriveBackupButton.style.fontSize = '13px';
+          gdriveBackupButton.style.lineHeight = '18px'; gdriveBackupButton.style.width = 'auto';
+          gdriveBackupButton.addEventListener('mouseenter', () => { gdriveBackupButton.style.filter = 'brightness(1.08)'; gdriveBackupButton.style.boxShadow = '0 6px 14px rgba(26,115,232,0.45)'; });
+          gdriveBackupButton.addEventListener('mouseleave', () => { gdriveBackupButton.style.filter = ''; gdriveBackupButton.style.boxShadow = '0 3px 8px rgba(26,115,232,0.35)'; });
+
+          const gdriveRestoreButton = document.createElement('button');
+          gdriveRestoreButton.textContent = t('gdriveRestore');
+          gdriveRestoreButton.title = t('gdriveRestoreTitle');
+          gdriveRestoreButton.addEventListener('click', function() {
+            if (typeof importFromGoogleDrive === 'function') { importFromGoogleDrive(); }
+            else { alert(t('gdriveImportUnavailable')); }
+          });
+          gdriveRestoreButton.style.backgroundImage = 'linear-gradient(180deg, #34a853, #137333)';
+          gdriveRestoreButton.style.color = '#fff'; gdriveRestoreButton.style.border = 'none'; gdriveRestoreButton.style.borderRadius = '10px';
+          gdriveRestoreButton.style.padding = '8px 12px'; gdriveRestoreButton.style.fontWeight = '600'; gdriveRestoreButton.style.cursor = 'pointer';
+          gdriveRestoreButton.style.boxShadow = '0 3px 8px rgba(19, 115, 51, 0.35)';
+          gdriveRestoreButton.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+          gdriveRestoreButton.style.whiteSpace = 'nowrap'; gdriveRestoreButton.style.display = 'inline-flex'; gdriveRestoreButton.style.alignItems = 'center';
+          gdriveRestoreButton.style.flex = '0 0 auto'; gdriveRestoreButton.style.gap = '4px'; gdriveRestoreButton.style.fontSize = '13px';
+          gdriveRestoreButton.style.lineHeight = '18px'; gdriveRestoreButton.style.width = 'auto';
+          gdriveRestoreButton.addEventListener('mouseenter', () => { gdriveRestoreButton.style.filter = 'brightness(1.08)'; gdriveRestoreButton.style.boxShadow = '0 6px 14px rgba(19,115,51,0.45)'; });
+          gdriveRestoreButton.addEventListener('mouseleave', () => { gdriveRestoreButton.style.filter = ''; gdriveRestoreButton.style.boxShadow = '0 3px 8px rgba(19,115,51,0.35)'; });
+
+          const gdriveButtonContainer = document.createElement('div');
+          gdriveButtonContainer.style.display = 'flex'; gdriveButtonContainer.style.gap = '8px'; gdriveButtonContainer.style.marginTop = '8px';
+          gdriveButtonContainer.style.justifyContent = 'center'; gdriveButtonContainer.style.alignItems = 'center'; gdriveButtonContainer.style.width = '100%';
+          gdriveButtonContainer.appendChild(gdriveBackupButton);
+          gdriveButtonContainer.appendChild(gdriveRestoreButton);
+          tabPane.appendChild(gdriveButtonContainer);
+
+          // Dropbox-Hilfepanel direkt im Skripte-Tab anzeigen
+          try { injectDropboxHelpPanel(tabPane); } catch (_) {}
+          // Google Drive Hilfepanel im Skripte-Tab anzeigen
+          try { injectGdriveHelpPanel(tabPane); } catch (_) {}
+
+          // Auto Save UI
+          try {
+            var autoSaveUI = createAutoSaveUI();
+            tabPane.appendChild(autoSaveUI);
+            loadAutoSaveSettings();
+          } catch (_) {}
+
+          const keyListContainer = document.createElement('div');
+          keyListContainer.id = 'key-list-container';
+          keyListContainer.style.marginTop = '10px';
+          tabPane.appendChild(keyListContainer);
+
+          if (typeof window !== 'undefined') window.uiMounted = true;
+          ESM_DIAG.log('UI mounted via W.userscripts.registerSidebarTab');
+          return;
+        } catch (e) {
+          ESM_DIAG.error('Failed to mount via W.userscripts, falling back', e);
+        }
+      }
+
+      if (haveWazeWrapTab) {
+        try {
+          const html = `
+            <div id="esm-tab">
+              <p id="esm-title" style="font-weight:700;margin:0 0 6px 0;">${t('scriptTitle')}</p>
+              <p style="margin:0 0 8px 0;">${t('importExportDesc')}</p>
+              <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:center;align-items:center;width:100%;">
+                <button id="esm-export">${t('exportBackup')}</button>
+                <button id="esm-import">${t('importBackup')}</button>
+              </div>
+              <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:center;align-items:center;width:100%;">
+                <button id="esm-cloud-backup">${t('cloudBackup')}</button>
+                <button id="esm-cloud-restore">${t('cloudRestore')}</button>
+              </div>
+              <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:center;align-items:center;width:100%;">
+                <button id="esm-gdrive-backup">${t('gdriveBackup')}</button>
+                <button id="esm-gdrive-restore">${t('gdriveRestore')}</button>
+              </div>
+              <div id="key-list-container" style="border:1px solid rgba(0,0,0,0.1);border-radius:8px;padding:8px;max-height:320px;overflow:auto;"></div>
+            </div>`;
+          new WazeWrap.Interface.Tab(t('scriptTitle'), html, () => {
+const importBtn = document.getElementById('esm-import');
+if (importBtn) { importBtn.textContent = t('importBackup'); importBtn.title = t('importBackupTitle'); }
+const exportBtn = document.getElementById('esm-export');
+if (exportBtn) { exportBtn.textContent = t('exportBackup'); exportBtn.title = t('exportBackupTitle'); }
+const cloudBackupBtn = document.getElementById('esm-cloud-backup');
+if (cloudBackupBtn) { cloudBackupBtn.textContent = t('cloudBackup'); cloudBackupBtn.title = t('cloudBackupTitle'); }
+const cloudRestoreBtn = document.getElementById('esm-cloud-restore');
+if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRestoreBtn.title = t('cloudRestoreTitle'); }
+            if (cloudBackupBtn) cloudBackupBtn.textContent = t('cloudBackup');
+            if (cloudRestoreBtn) cloudRestoreBtn.textContent = t('cloudRestore');
+
+            if (importBtn) importBtn.addEventListener('click', function() { if (typeof window.importLocalStorage === 'function') { window.importLocalStorage(); } else { try { if (window.ESM_DIAG) window.ESM_DIAG.error('Import function not available'); } catch (_) {} alert(t('importFunctionUnavailable')); } });
+            if (exportBtn) exportBtn.addEventListener('click', function() { if (typeof window.exportLocalStorage === 'function') { window.exportLocalStorage(); } else { try { if (window.ESM_DIAG) window.ESM_DIAG.error('Export function not available'); } catch (_) {} alert(t('exportFunctionUnavailable')); } });
+            if (cloudBackupBtn) cloudBackupBtn.addEventListener('click', function() { if (typeof exportToDropbox === 'function') { exportToDropbox(); } else { try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox export function not available'); } catch (_) {} alert(t('dropboxExportUnavailable')); } });
+            if (cloudRestoreBtn) cloudRestoreBtn.addEventListener('click', function() { if (typeof importFromDropbox === 'function') { importFromDropbox(); } else { try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox import function not available'); } catch (_) {} alert(t('dropboxImportUnavailable')); } });
+            // Reihenfolge im Flex-Container: zuerst Lokal Speichern (Export), dann Wiederherstellen (Import)
+            if (typeof exportBtn !== 'undefined' && exportBtn) exportBtn.style.order = '1';
+            if (typeof importBtn !== 'undefined' && importBtn) importBtn.style.order = '2';
+
+            // Apply compact styles for WazeWrap tab buttons
+            if (importBtn) {
+              importBtn.style.backgroundImage = 'linear-gradient(180deg, #2196f3, #1976d2)';
+              importBtn.style.color = '#fff';
+              importBtn.style.border = 'none';
+              importBtn.style.borderRadius = '10px';
+              importBtn.style.padding = '8px 12px';
+              importBtn.style.fontWeight = '600';
+              importBtn.style.cursor = 'pointer';
+              importBtn.style.boxShadow = '0 3px 8px rgba(25, 118, 210, 0.35)';
+              importBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              importBtn.style.whiteSpace = 'nowrap';
+              importBtn.style.display = 'inline-flex';
+              importBtn.style.alignItems = 'center';
+              importBtn.style.gap = '4px';
+              importBtn.style.fontSize = '13px';
+              importBtn.style.lineHeight = '18px';
+            }
+            if (exportBtn) {
+              exportBtn.style.backgroundImage = 'linear-gradient(180deg, #43a047, #2e7d32)';
+              exportBtn.style.color = '#fff';
+              exportBtn.style.border = 'none';
+              exportBtn.style.borderRadius = '10px';
+              exportBtn.style.padding = '8px 12px';
+              exportBtn.style.fontWeight = '600';
+              exportBtn.style.cursor = 'pointer';
+              exportBtn.style.boxShadow = '0 3px 8px rgba(46, 125, 50, 0.35)';
+              exportBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              exportBtn.style.whiteSpace = 'nowrap';
+              exportBtn.style.display = 'inline-flex';
+              exportBtn.style.alignItems = 'center';
+              exportBtn.style.gap = '4px';
+              exportBtn.style.fontSize = '13px';
+              exportBtn.style.lineHeight = '18px';
+            }
+            if (cloudBackupBtn) {
+              cloudBackupBtn.style.backgroundImage = 'linear-gradient(180deg, #ff9800, #f57c00)';
+              cloudBackupBtn.style.color = '#fff';
+              cloudBackupBtn.style.border = 'none';
+              cloudBackupBtn.style.borderRadius = '10px';
+              cloudBackupBtn.style.padding = '8px 12px';
+              cloudBackupBtn.style.fontWeight = '600';
+              cloudBackupBtn.style.cursor = 'pointer';
+              cloudBackupBtn.style.boxShadow = '0 3px 8px rgba(245, 124, 0, 0.35)';
+              cloudBackupBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              cloudBackupBtn.style.whiteSpace = 'nowrap';
+              cloudBackupBtn.style.display = 'inline-flex';
+              cloudBackupBtn.style.alignItems = 'center';
+              cloudBackupBtn.style.gap = '4px';
+              cloudBackupBtn.style.fontSize = '13px';
+              cloudBackupBtn.style.lineHeight = '18px';
+    cloudBackupBtn.title = t('cloudBackupTitle');
+            }
+            if (cloudRestoreBtn) {
+              cloudRestoreBtn.style.backgroundImage = 'linear-gradient(180deg, #9c27b0, #7b1fa2)';
+              cloudRestoreBtn.style.color = '#fff';
+              cloudRestoreBtn.style.border = 'none';
+              cloudRestoreBtn.style.borderRadius = '10px';
+              cloudRestoreBtn.style.padding = '8px 12px';
+              cloudRestoreBtn.style.fontWeight = '600';
+              cloudRestoreBtn.style.cursor = 'pointer';
+              cloudRestoreBtn.style.boxShadow = '0 3px 8px rgba(123, 31, 162, 0.35)';
+              cloudRestoreBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              cloudRestoreBtn.style.whiteSpace = 'nowrap';
+              cloudRestoreBtn.style.display = 'inline-flex';
+              cloudRestoreBtn.style.alignItems = 'center';
+              cloudRestoreBtn.style.gap = '4px';
+              cloudRestoreBtn.style.fontSize = '13px';
+              cloudRestoreBtn.style.lineHeight = '18px';
+    cloudRestoreBtn.title = t('cloudRestoreTitle');
+            }
+            // Google Drive buttons in WazeWrap tab
+            const gdriveBackupBtn = document.getElementById('esm-gdrive-backup');
+            const gdriveRestoreBtn = document.getElementById('esm-gdrive-restore');
+            if (gdriveBackupBtn) { gdriveBackupBtn.textContent = t('gdriveBackup'); gdriveBackupBtn.title = t('gdriveBackupTitle'); }
+            if (gdriveRestoreBtn) { gdriveRestoreBtn.textContent = t('gdriveRestore'); gdriveRestoreBtn.title = t('gdriveRestoreTitle'); }
+            if (gdriveBackupBtn) gdriveBackupBtn.addEventListener('click', function() { if (typeof exportToGoogleDrive === 'function') { exportToGoogleDrive(); } else { alert(t('gdriveExportUnavailable')); } });
+            if (gdriveRestoreBtn) gdriveRestoreBtn.addEventListener('click', function() { if (typeof importFromGoogleDrive === 'function') { importFromGoogleDrive(); } else { alert(t('gdriveImportUnavailable')); } });
+            if (gdriveBackupBtn) {
+              gdriveBackupBtn.style.backgroundImage = 'linear-gradient(180deg, #4285f4, #1a73e8)';
+              gdriveBackupBtn.style.color = '#fff'; gdriveBackupBtn.style.border = 'none'; gdriveBackupBtn.style.borderRadius = '10px';
+              gdriveBackupBtn.style.padding = '8px 12px'; gdriveBackupBtn.style.fontWeight = '600'; gdriveBackupBtn.style.cursor = 'pointer';
+              gdriveBackupBtn.style.boxShadow = '0 3px 8px rgba(26, 115, 232, 0.35)';
+              gdriveBackupBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              gdriveBackupBtn.style.whiteSpace = 'nowrap'; gdriveBackupBtn.style.display = 'inline-flex'; gdriveBackupBtn.style.alignItems = 'center';
+              gdriveBackupBtn.style.gap = '4px'; gdriveBackupBtn.style.fontSize = '13px'; gdriveBackupBtn.style.lineHeight = '18px';
+            }
+            if (gdriveRestoreBtn) {
+              gdriveRestoreBtn.style.backgroundImage = 'linear-gradient(180deg, #34a853, #137333)';
+              gdriveRestoreBtn.style.color = '#fff'; gdriveRestoreBtn.style.border = 'none'; gdriveRestoreBtn.style.borderRadius = '10px';
+              gdriveRestoreBtn.style.padding = '8px 12px'; gdriveRestoreBtn.style.fontWeight = '600'; gdriveRestoreBtn.style.cursor = 'pointer';
+              gdriveRestoreBtn.style.boxShadow = '0 3px 8px rgba(19, 115, 51, 0.35)';
+              gdriveRestoreBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+              gdriveRestoreBtn.style.whiteSpace = 'nowrap'; gdriveRestoreBtn.style.display = 'inline-flex'; gdriveRestoreBtn.style.alignItems = 'center';
+              gdriveRestoreBtn.style.gap = '4px'; gdriveRestoreBtn.style.fontSize = '13px'; gdriveRestoreBtn.style.lineHeight = '18px';
+            }
+            if (typeof window !== 'undefined') window.uiMounted = true;
+            ESM_DIAG.log('UI mounted via WazeWrap.Interface.Tab');
+            // Dropbox-Hilfepanel im WazeWrap-Tab platzieren
+            try { const tabRoot = document.getElementById('esm-tab') || document.body; injectDropboxHelpPanel(tabRoot); } catch (_) {}
+            // Google Drive Hilfepanel im WazeWrap-Tab platzieren
+            try { const tabRoot2 = document.getElementById('esm-tab') || document.body; injectGdriveHelpPanel(tabRoot2); } catch (_) {}
+            // Auto Save UI im WazeWrap-Tab
+            try {
+              const tabRoot3 = document.getElementById('esm-tab') || document.body;
+              const autoSaveUI = createAutoSaveUI();
+              tabRoot3.appendChild(autoSaveUI);
+              loadAutoSaveSettings();
+            } catch (_) {}
+          });
+          return;
+        } catch (e) {
+          ESM_DIAG.error('Failed to mount via WazeWrap.Interface.Tab, falling back', e);
+        }
+      }
+
+      // Final fallback: floating panel
       createFallbackPanel();
     }
 
-    function initialize() {
-      const isWaze = location.hostname.includes('waze.com');
-      if (isWaze) {
-        if (typeof currentWindow.SDK_INITIALIZED !== 'undefined') {
-          currentWindow.SDK_INITIALIZED.then(addScriptTab);
-        } else {
-          document.addEventListener('wme-ready', addScriptTab, { once: true });
+     // Initialize the script
+  function initialize() {
+    ESM_DIAG.log('initialize() called. document.readyState=', document.readyState);
+
+    // Check if we're in a Waze environment
+    const isWazeEnvironment = window.location.hostname.includes('waze.com');
+
+    if (isWazeEnvironment && typeof W !== 'undefined' && W && W.userscripts && W.userscripts.state && W.userscripts.state.isReady) {
+      ESM_DIAG.log('W.userscripts.state.isReady is true. Initializing UI.');
+      addScriptTab();
+      showScriptUpdate();
+      reapplyAfterReload();
+    } else if (isWazeEnvironment) {
+      ESM_DIAG.log('Waiting for wme-ready event...');
+      document.addEventListener('wme-ready', function () {
+        ESM_DIAG.log('wme-ready event received. Initializing UI.');
+        addScriptTab();
+        showScriptUpdate();
+        reapplyAfterReload();
+      }, { once: true });
+    } else {
+      // Non-Waze environment - use fallback panel directly
+      ESM_DIAG.log('Non-Waze environment detected. Using fallback panel.');
+      createFallbackPanel();
+      reapplyAfterReload();
+    }
+  }
+
+  // Call the initialize function
+  initialize();
+
+  // Show script update notification
+  function showScriptUpdate() {
+    if (typeof WazeWrap !== 'undefined' && WazeWrap && WazeWrap.Interface && typeof WazeWrap.Interface.ShowScriptUpdate === 'function') {
+      WazeWrap.Interface.ShowScriptUpdate(
+        t('scriptTitle'),
+        (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : scriptVersion,
+        updateMessage,
+        'https://greasyfork.org/en/scripts/466806-easy-storage-manager',
+        'https://www.waze.com/forum/viewtopic.php?t=382966'
+      );
+    } else {
+      ESM_DIAG.warn('ShowScriptUpdate skipped: WazeWrap.Interface.ShowScriptUpdate not available yet.');
+    }
+  }
+
+  // Reapply after reload if a stash exists (inside IIFE)
+  function reapplyAfterReload() {
+    let stashStr = null;
+    try {
+      stashStr = sessionStorage.getItem(REAPPLY_STASH_KEY);
+    } catch (e) {
+      stashStr = null;
+    }
+    if (!stashStr) { ESM_DIAG.log('No reapply stash found; skipping.'); return; }
+    sessionStorage.removeItem(REAPPLY_STASH_KEY);
+    ESM_DIAG.log('Reapply stash found. Parsing...');
+    try {
+      const stash = JSON.parse(stashStr);
+      ESM_DIAG.log('Parsed stash items count:', Array.isArray(stash.items) ? stash.items.length : 0);
+      if (!(stash && stash.origin === location.origin && Array.isArray(stash.items) && stash.items.length)) { ESM_DIAG.warn('Stash invalid or empty; skipping.'); return; }
+
+      applyPairs(stash.items).then(({ counts, failures }) => {
+        ESM_DIAG.log('Initial applyPairs after reload complete.', counts, failures.slice(0, 3));
+        const summary = `Restored after reload executed.\n- localStorage: ${counts.local}\n- sessionStorage: ${counts.session}\n- Cookies: ${counts.cookie}\n- IndexedDB: ${counts.idb}` + (failures.length ? `\n\nError (first ${Math.min(5, failures.length)}):\n${failures.slice(0,5).join('\n')}${failures.length > 5 ? `\n... (${failures.length - 5} more)` : ''}` : '');
+        try { alert(summary); } catch (e) {}
+      }).catch((ex) => { ESM_DIAG.error('applyPairs after reload failed:', ex); });
+
+      const desiredLocal = new Map();
+      for (const [fullKey, value] of stash.items) {
+        const idx = fullKey.indexOf(':');
+        const type = idx < 0 ? 'localStorage' : fullKey.slice(0, idx);
+        const name = idx < 0 ? fullKey : fullKey.slice(idx + 1);
+        if (type === 'localStorage') {
+          desiredLocal.set(name, value);
         }
-        document.addEventListener('wme-ready', () => {
-          if (typeof WazeWrap !== 'undefined' && WazeWrap.Interface && WazeWrap.Interface.ShowScriptUpdate) {
-            WazeWrap.Interface.ShowScriptUpdate('Easy Storage Manager', scriptVersion, updateMessage, 'https://greasyfork.org/en/scripts/466806-easy-storage-manager', 'https://www.waze.com/forum/viewtopic.php?t=382966');
-          }
-        }, { once: true });
-      } else {
-        createFallbackPanel();
       }
-    }
+      ESM_DIAG.log('Desired localStorage keys:', Array.from(desiredLocal.keys()));
 
-    initialize();
-
-    function reapplyAfterReload() {
-      const stashStr = sessionStorage.getItem(REAPPLY_STASH_KEY);
-      if (!stashStr) return;
-      sessionStorage.removeItem(REAPPLY_STASH_KEY);
-      try {
-        const stash = JSON.parse(stashStr);
-        if (stash && stash.origin === location.origin && Array.isArray(stash.items)) {
-          applyPairs(stash.items).then(() => {
-            currentWindow.alert('Restored after reload.');
-          });
-          // Protection logic same as updated script...
-          const desiredLocal = new Map();
-          stash.items.forEach(([k, v]) => { if(!k.includes(':')) desiredLocal.set(k, v); else if(k.startsWith('localStorage:')) desiredLocal.set(k.split(':')[1], v); });
-          if(desiredLocal.size > 0) {
-            const protectUntil = Date.now() + 120000;
-            const originalSet = localStorage.setItem.bind(localStorage);
-            localStorage.setItem = function(k, v) {
-              if (Date.now() < protectUntil && desiredLocal.has(k)) {
-                return NativeStorage.setItem.call(window.localStorage, k, desiredLocal.get(k));
+      const scheduleRepairs = (delaysMs) => {
+        ESM_DIAG.log('Scheduling repairs with delays:', delaysMs);
+        delaysMs.forEach(ms => {
+          setTimeout(() => {
+            const repairs = [];
+            desiredLocal.forEach((desired, name) => {
+              try {
+                const current = NativeStorage.getItem.call(window.localStorage, name);
+                if (current !== desired) {
+                  ESM_DIAG.log('Repair needed for key:', name, 'current=', current, 'desired=', desired);
+                  repairs.push([`localStorage:${name}`, desired]);
+                } else {
+                  ESM_DIAG.log('Key already correct:', name);
+                }
+              } catch (e) {
+                ESM_DIAG.warn('Error reading key during repair check:', name, e);
               }
-              return originalSet(k, v);
-            };
-          }
-        }
-      } catch (e) {}
-    }
+            });
+            if (repairs.length) {
+              ESM_DIAG.log('Applying repairs count:', repairs.length);
+              applyPairs(repairs).catch((ex) => { ESM_DIAG.error('applyPairs repairs failed:', ex); });
+            }
+          }, ms);
+        });
+      };
 
-    async function writeIndexedDBRecord(record) {
-      return new Promise((resolve, reject) => {
-        const req = indexedDB.open(record.db);
-        req.onsuccess = () => {
-          const db = req.result;
-          if (!db.objectStoreNames.contains(record.store)) {
-            db.close();
-            const bump = indexedDB.open(record.db, db.version + 1);
-            bump.onupgradeneeded = (e) => {
-              const db2 = e.target.result;
-              const s = db2.createObjectStore(record.store, { keyPath: record.keyPath, autoIncrement: record.autoIncrement });
-              if (record.indexes) record.indexes.forEach(ix => s.createIndex(ix.name, ix.keyPath, { unique: ix.unique, multiEntry: ix.multiEntry }));
-            };
-            bump.onsuccess = () => {
-              const db3 = bump.result;
-              const tx = db3.transaction([record.store], 'readwrite');
-              if (record.keyPath) tx.objectStore(record.store).put(record.value);
-              else tx.objectStore(record.store).put(record.value, record.key);
-              tx.oncomplete = () => { db3.close(); resolve(); };
-            };
-          } else {
+      const originalSetItem = localStorage.setItem.bind(localStorage);
+      const originalGetItem = localStorage.getItem.bind(localStorage);
+      const originalRemoveItem = localStorage.removeItem.bind(localStorage);
+      const originalClear = localStorage.clear.bind(localStorage);
+      const originalProtoSetItem = Storage.prototype.setItem;
+      const originalProtoGetItem = Storage.prototype.getItem;
+      const originalProtoRemoveItem = Storage.prototype.removeItem;
+      const originalProtoClear = Storage.prototype.clear;
+      const protectMs = 120000; // 120s protection
+      const protectUntil = Date.now() + protectMs;
+      const protectedKeys = new Set(Array.from(desiredLocal.keys()));
+
+      try {
+        localStorage.setItem = function (key, value) {
+          if (protectedKeys.has(key) && Date.now() < protectUntil) {
+            ESM_DIAG.log('Protected setItem intercepted for key:', key);
+            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (e) { return; }
+          }
+          return originalSetItem(key, value);
+        };
+
+        localStorage.getItem = function (key) {
+          if (protectedKeys.has(key) && Date.now() < protectUntil) {
+            const desired = desiredLocal.get(key);
+            ESM_DIAG.log('Protected getItem intercepted for key:', key);
+            return typeof desired === 'string' ? desired : desired;
+          }
+          return NativeStorage.getItem.call(window.localStorage, key);
+        };
+
+        localStorage.removeItem = function (key) {
+          if (protectedKeys.has(key) && Date.now() < protectUntil) {
+            ESM_DIAG.log('Protected removeItem blocked for key:', key);
+            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (_) { return; }
+          }
+          return originalRemoveItem(key);
+        };
+
+        localStorage.clear = function () {
+          if (Date.now() < protectUntil && protectedKeys.size) {
+            ESM_DIAG.log('Protected clear intercepted; preserving keys:', Array.from(protectedKeys));
+            try {
+              const len = window.localStorage.length;
+              const toRemove = [];
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.localStorage, i);
+                if (k != null && !protectedKeys.has(k)) toRemove.push(k);
+              }
+              toRemove.forEach(k => { try { originalRemoveItem(k); } catch (_) {} });
+              return;
+            } catch (_) { /* fallback */ }
+          }
+          return originalClear();
+        };
+
+        Storage.prototype.setItem = function (key, value) {
+          const isLocal = this === window.localStorage || this === localStorage;
+          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
+            ESM_DIAG.log('Prototype setItem intercepted for key:', key);
+            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (e) { return; }
+          }
+          return originalProtoSetItem.call(this, key, value);
+        };
+
+        Storage.prototype.getItem = function (key) {
+          const isLocal = this === window.localStorage || this === localStorage;
+          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
+            const desired = desiredLocal.get(key);
+            ESM_DIAG.log('Prototype getItem intercepted for key:', key);
+            return typeof desired === 'string' ? desired : desired;
+          }
+          return originalProtoGetItem.call(this, key);
+        };
+
+        Storage.prototype.removeItem = function (key) {
+          const isLocal = this === window.localStorage || this === localStorage;
+          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
+            ESM_DIAG.log('Prototype removeItem blocked for key:', key);
+            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (_) { return; }
+          }
+          return originalProtoRemoveItem.call(this, key);
+        };
+
+        Storage.prototype.clear = function () {
+          const isLocal = this === window.localStorage || this === localStorage;
+          if (isLocal && Date.now() < protectUntil && protectedKeys.size) {
+            ESM_DIAG.log('Prototype clear intercepted; preserving keys:', Array.from(protectedKeys));
+            try {
+              const len = window.localStorage.length;
+              const toRemove = [];
+              for (let i = 0; i < len; i++) {
+                const k = NativeStorage.key.call(window.localStorage, i);
+                if (k != null && !protectedKeys.has(k)) toRemove.push(k);
+              }
+              toRemove.forEach(k => { try { originalRemoveItem(k); } catch (_) {} });
+              return;
+            } catch (_) { /* fallback */ }
+          }
+          return originalProtoClear.call(this);
+        };
+
+        ESM_DIAG.log('Protection overrides applied for keys:', Array.from(protectedKeys), 'until', new Date(protectUntil).toISOString());
+      } catch (ex) {
+        ESM_DIAG.error('Error applying protection overrides:', ex);
+      }
+
+      scheduleRepairs([500, 2000, 5000, 10000, 20000, 30000, 45000, 60000, 90000, 120000]);
+    } catch (ex) {
+      ESM_DIAG.error('Error parsing stash or scheduling repairs:', ex);
+    }
+  }
+
+  // Export key functions to window for fallback usage
+  if (typeof window !== 'undefined') {
+    window.exportLocalStorage = exportLocalStorage;
+    window.importLocalStorage = importLocalStorage;
+    window.exportToGoogleDrive = exportToGoogleDrive;
+    window.importFromGoogleDrive = importFromGoogleDrive;
+  }
+
+  // Properly close IIFE
+  })();
+
+  // Duplicate reapplyAfterReload removed; the IIFE version is used.
+
+  async function writeIndexedDBRecord(record) {
+    return new Promise((resolve, reject) => {
+      const openReq = indexedDB.open(record.db);
+      openReq.onerror = () => reject(openReq.error);
+      openReq.onupgradeneeded = () => { /* no-op */ };
+      openReq.onsuccess = () => {
+        const db = openReq.result;
+        const proceedWrite = () => {
+          try {
             const tx = db.transaction([record.store], 'readwrite');
-            if (record.keyPath) tx.objectStore(record.store).put(record.value);
-            else tx.objectStore(record.store).put(record.value, record.key);
-            tx.oncomplete = () => { db.close(); resolve(); };
+            const st = tx.objectStore(record.store);
+            let req;
+            if (st.keyPath) {
+              req = st.put(record.value);
+            } else {
+              req = st.put(record.value, record.key);
+            }
+            req.onerror = () => reject(req.error);
+            tx.oncomplete = () => { db.close(); resolve(true); };
+            tx.onerror = () => reject(tx.error);
+          } catch (err) {
+            reject(err);
           }
         };
-      });
-    }
+        if (!db.objectStoreNames.contains(record.store)) {
+          db.close();
+          const bump = indexedDB.open(record.db, (db.version || 1) + 1);
+          bump.onerror = () => reject(bump.error);
+          bump.onupgradeneeded = (evt) => {
+            const db2 = evt.target.result;
+            if (!db2.objectStoreNames.contains(record.store)) {
+              const opts = {};
+              if (record.keyPath) opts.keyPath = record.keyPath;
+              if (record.autoIncrement) opts.autoIncrement = true;
+              const newStore = db2.createObjectStore(record.store, opts);
+              if (Array.isArray(record.indexes)) {
+                record.indexes.forEach(ix => {
+                  try {
+                    newStore.createIndex(ix.name, ix.keyPath, { unique: !!ix.unique, multiEntry: !!ix.multiEntry });
+                  } catch (e) { /* ignore invalid index definitions */ }
+                });
+              }
+            }
+          };
+          bump.onsuccess = () => {
+            const db2 = bump.result;
+            try {
+              const tx = db2.transaction([record.store], 'readwrite');
+              const st = tx.objectStore(record.store);
+              let req;
+              if (st.keyPath) {
+                req = st.put(record.value);
+              } else {
+                req = st.put(record.value, record.key);
+              }
+              req.onerror = () => reject(req.error);
+              tx.oncomplete = () => { db2.close(); resolve(true); };
+              tx.onerror = () => reject(tx.error);
+            } catch (err) {
+              reject(err);
+            }
+          };
+        } else {
+          proceedWrite();
+        }
+      };
+    });
+  }
 
-    function createFallbackPanel() {
-      if (document.readyState !== 'complete') {
-        window.addEventListener('load', createFallbackPanel, { once: true });
-        return;
-      }
-      if (currentWindow.uiMounted) return;
+  // Duplicate applyPairs removed; using the in-IIFE implementation.
+  let uiMounted = false;
+  function ensureDOMReady(cb) {
+    if (document.readyState === 'interactive' || document.readyState === 'complete') {
+      try { cb(); } catch (e) { if (window.ESM_DIAG) window.ESM_DIAG.error('ensureDOMReady callback error', e); }
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        try { cb(); } catch (e) { if (window.ESM_DIAG) window.ESM_DIAG.error('ensureDOMReady DOMContentLoaded error', e); }
+      }, { once: true });
+    }
+  }
+
+  function createFallbackPanel() {
+    ensureDOMReady(() => {
+      if (window.uiMounted) return;
       const panel = document.createElement('div');
       panel.id = 'esm-fallback-panel';
-      panel.style.position = 'fixed'; panel.style.top = '72px'; panel.style.right = '12px';
-      panel.style.zIndex = '999999'; panel.style.background = '#1e293b'; panel.style.padding = '12px';
-      panel.style.borderRadius = '12px'; panel.style.color = '#fff'; panel.style.maxWidth = '400px';
-      setupUIElements(panel);
-      document.body.appendChild(panel);
-      currentWindow.uiMounted = true;
-    }
+      panel.style.position = 'fixed';
+      panel.style.top = '72px';
+      panel.style.right = '12px';
+      panel.style.zIndex = '999999';
+      panel.style.background = 'rgba(30, 41, 59, 0.93)';
+      panel.style.backdropFilter = 'blur(4px)';
+      panel.style.border = '1px solid rgba(255,255,255,0.12)';
+      panel.style.borderRadius = '12px';
+      panel.style.padding = '12px 14px';
+      panel.style.boxShadow = '0 6px 18px rgba(0,0,0,0.35)';
+      panel.style.color = '#eaeef5';
+      panel.style.maxWidth = '420px';
+      panel.style.fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif';
 
-})();
+      const title = document.createElement('div');
+    title.textContent = t('scriptTitle');
+      title.style.fontWeight = '700';
+      title.style.marginBottom = '6px';
+      title.style.letterSpacing = '0.2px';
+      panel.appendChild(title);
+
+      const desc = document.createElement('div');
+    desc.textContent = t('fallbackDesc');
+      desc.style.fontSize = '12px';
+      desc.style.opacity = '0.9';
+      desc.style.marginBottom = '8px';
+      panel.appendChild(desc);
+
+      const btnRow = document.createElement('div');
+      btnRow.className = 'btnRow';
+      btnRow.style.display = 'grid';
+      btnRow.style.gridTemplateColumns = '1fr 1fr 1fr';
+      btnRow.style.gap = '8px';
+      btnRow.style.marginBottom = '10px';
+      btnRow.style.alignItems = 'stretch';
+      btnRow.style.width = '100%';
+      btnRow.style.boxSizing = 'border-box';
+      const importBtn = document.createElement('button');
+      importBtn.id = 'esm-import-btn';
+    importBtn.textContent = t('importBackup');
+    importBtn.title = t('importBackupTitle');
+      importBtn.style.backgroundImage = 'linear-gradient(180deg, #2196f3, #1976d2)';
+      importBtn.style.color = '#fff';
+      importBtn.style.border = 'none';
+      importBtn.style.borderRadius = '10px';
+      importBtn.style.padding = '8px 12px';
+      importBtn.style.fontWeight = '600';
+      importBtn.style.cursor = 'pointer';
+      importBtn.style.boxShadow = '0 3px 8px rgba(25, 118, 210, 0.35)';
+      importBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      importBtn.style.whiteSpace = 'nowrap';
+      importBtn.style.display = 'inline-flex';
+      importBtn.style.alignItems = 'center';
+      importBtn.style.gap = '4px';
+      importBtn.style.fontSize = '13px';
+      importBtn.style.lineHeight = '18px';
+      importBtn.style.width = '100%';
+      importBtn.style.flex = '1 1 0';
+      importBtn.style.minWidth = '0';
+      importBtn.style.margin = '0';
+      importBtn.addEventListener('mouseenter', () => { importBtn.style.filter = 'brightness(1.08)'; importBtn.style.boxShadow = '0 6px 14px rgba(25,118,210,0.45)'; });
+      importBtn.addEventListener('mouseleave', () => { importBtn.style.filter = ''; importBtn.style.boxShadow = '0 3px 8px rgba(25,118,210,0.35)'; });
+      importBtn.addEventListener('click', function() {
+        if (typeof window.importLocalStorage === 'function') {
+          window.importLocalStorage();
+        } else {
+          try { if (window.ESM_DIAG) window.ESM_DIAG.error('Import function not available'); } catch (_) {}
+          alert(t('importFunctionUnavailable'));
+        }
+      });
+
+      const exportBtn = document.createElement('button');
+      exportBtn.id = 'esm-export-btn';
+    exportBtn.textContent = t('exportBackup');
+    exportBtn.title = t('exportBackupTitle');
+      exportBtn.style.backgroundImage = 'linear-gradient(180deg, #43a047, #2e7d32)';
+      exportBtn.style.color = '#fff';
+      exportBtn.style.border = 'none';
+      exportBtn.style.borderRadius = '10px';
+      exportBtn.style.padding = '8px 12px';
+      exportBtn.style.fontWeight = '600';
+      exportBtn.style.cursor = 'pointer';
+      exportBtn.style.boxShadow = '0 3px 8px rgba(46, 125, 50, 0.35)';
+      exportBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      exportBtn.style.whiteSpace = 'nowrap';
+      exportBtn.style.display = 'inline-flex';
+      exportBtn.style.alignItems = 'center';
+      exportBtn.style.gap = '4px';
+      exportBtn.style.fontSize = '13px';
+      exportBtn.style.lineHeight = '18px';
+      exportBtn.style.width = '100%';
+      exportBtn.style.flex = '1 1 0';
+      exportBtn.style.minWidth = '0';
+      exportBtn.style.margin = '0';
+      exportBtn.addEventListener('mouseenter', () => { exportBtn.style.filter = 'brightness(1.08)'; exportBtn.style.boxShadow = '0 6px 14px rgba(46,125,50,0.45)'; });
+      exportBtn.addEventListener('mouseleave', () => { exportBtn.style.filter = ''; exportBtn.style.boxShadow = '0 3px 8px rgba(46,125,50,0.35)'; });
+      exportBtn.addEventListener('click', function() {
+        if (typeof window.exportLocalStorage === 'function') {
+          window.exportLocalStorage();
+        } else {
+          try { if (window.ESM_DIAG) window.ESM_DIAG.error('Export function not available'); } catch (_) {}
+          alert(t('exportFunctionUnavailable'));
+        }
+      });
+      // Reihenfolge im Grid-Container: alle Buttons gleichberechtigt
+      exportBtn.style.order = '1';
+      importBtn.style.order = '2';
+      // Dropbox Backup Button
+      const driveBackupBtn = document.createElement('button');
+      driveBackupBtn.id = 'esm-drive-backup-btn';
+    driveBackupBtn.textContent = t('cloudBackup');
+    driveBackupBtn.title = t('cloudBackupTitle');
+      driveBackupBtn.style.backgroundImage = 'linear-gradient(180deg, #4285f4, #1a73e8)';
+      driveBackupBtn.style.color = '#fff';
+      driveBackupBtn.style.border = 'none';
+      driveBackupBtn.style.borderRadius = '10px';
+      driveBackupBtn.style.padding = '8px 12px';
+      driveBackupBtn.style.fontWeight = '600';
+      driveBackupBtn.style.cursor = 'pointer';
+      driveBackupBtn.style.boxShadow = '0 3px 8px rgba(26, 115, 232, 0.35)';
+      driveBackupBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      driveBackupBtn.style.whiteSpace = 'nowrap';
+      driveBackupBtn.style.display = 'inline-flex';
+      driveBackupBtn.style.alignItems = 'center';
+      driveBackupBtn.style.gap = '4px';
+      driveBackupBtn.style.fontSize = '13px';
+      driveBackupBtn.style.lineHeight = '18px';
+      driveBackupBtn.style.width = '100%';
+      driveBackupBtn.style.flex = '1 1 0';
+      driveBackupBtn.style.minWidth = '0';
+      driveBackupBtn.style.margin = '0';
+      driveBackupBtn.addEventListener('mouseenter', () => { driveBackupBtn.style.filter = 'brightness(1.08)'; driveBackupBtn.style.boxShadow = '0 6px 14px rgba(26,115,232,0.45)'; });
+      driveBackupBtn.addEventListener('mouseleave', () => { driveBackupBtn.style.filter = ''; driveBackupBtn.style.boxShadow = '0 3px 8px rgba(26,115,232,0.35)'; });
+      driveBackupBtn.addEventListener('click', function() {
+        if (typeof window.exportToDropbox === 'function') {
+          window.exportToDropbox();
+        } else {
+          try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox backup function not available'); } catch (_) {}
+          alert(t('dropboxExportUnavailable'));
+        }
+      });
+
+      // Dropbox Restore Button
+      const driveRestoreBtn = document.createElement('button');
+      driveRestoreBtn.id = 'esm-drive-restore-btn';
+    driveRestoreBtn.textContent = t('cloudRestore');
+    driveRestoreBtn.title = t('cloudRestoreTitle');
+      driveRestoreBtn.style.backgroundImage = 'linear-gradient(180deg, #34a853, #137333)';
+      driveRestoreBtn.style.color = '#fff';
+      driveRestoreBtn.style.border = 'none';
+      driveRestoreBtn.style.borderRadius = '10px';
+      driveRestoreBtn.style.padding = '8px 12px';
+      driveRestoreBtn.style.fontWeight = '600';
+      driveRestoreBtn.style.cursor = 'pointer';
+      driveRestoreBtn.style.boxShadow = '0 3px 8px rgba(19, 115, 51, 0.35)';
+      driveRestoreBtn.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      driveRestoreBtn.style.whiteSpace = 'nowrap';
+      driveRestoreBtn.style.display = 'inline-flex';
+      driveRestoreBtn.style.alignItems = 'center';
+      driveRestoreBtn.style.gap = '4px';
+      driveRestoreBtn.style.fontSize = '13px';
+      driveRestoreBtn.style.lineHeight = '18px';
+      driveRestoreBtn.style.width = '100%';
+      driveRestoreBtn.style.flex = '1 1 0';
+      driveRestoreBtn.style.minWidth = '0';
+      driveRestoreBtn.style.margin = '0';
+      driveRestoreBtn.addEventListener('mouseenter', () => { driveRestoreBtn.style.filter = 'brightness(1.08)'; driveRestoreBtn.style.boxShadow = '0 6px 14px rgba(19,115,51,0.45)'; });
+      driveRestoreBtn.addEventListener('mouseleave', () => { driveRestoreBtn.style.filter = ''; driveRestoreBtn.style.boxShadow = '0 3px 8px rgba(19,115,51,0.35)'; });
+      driveRestoreBtn.addEventListener('click', function() {
+        if (typeof window.importFromDropbox === 'function') {
+          window.importFromDropbox();
+        } else {
+          try { if (window.ESM_DIAG) window.ESM_DIAG.error('Dropbox restore function not available'); } catch (_) {}
+          alert(t('dropboxImportUnavailable'));
+        }
+      });
+
+      btnRow.appendChild(exportBtn);
+      btnRow.appendChild(importBtn);
+      btnRow.appendChild(driveBackupBtn);
+      btnRow.appendChild(driveRestoreBtn);
+
+      // Google Drive Backup Button (Fallback)
+      const gdriveBackupFb = document.createElement('button');
+      gdriveBackupFb.id = 'esm-gdrive-backup-btn';
+      gdriveBackupFb.textContent = t('gdriveBackup');
+      gdriveBackupFb.title = t('gdriveBackupTitle');
+      gdriveBackupFb.style.backgroundImage = 'linear-gradient(180deg, #4285f4, #1a73e8)';
+      gdriveBackupFb.style.color = '#fff'; gdriveBackupFb.style.border = 'none'; gdriveBackupFb.style.borderRadius = '10px';
+      gdriveBackupFb.style.padding = '8px 12px'; gdriveBackupFb.style.fontWeight = '600'; gdriveBackupFb.style.cursor = 'pointer';
+      gdriveBackupFb.style.boxShadow = '0 3px 8px rgba(26, 115, 232, 0.35)';
+      gdriveBackupFb.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      gdriveBackupFb.style.whiteSpace = 'nowrap'; gdriveBackupFb.style.display = 'inline-flex'; gdriveBackupFb.style.alignItems = 'center';
+      gdriveBackupFb.style.gap = '4px'; gdriveBackupFb.style.fontSize = '13px'; gdriveBackupFb.style.lineHeight = '18px';
+      gdriveBackupFb.style.width = '100%'; gdriveBackupFb.style.flex = '1 1 0'; gdriveBackupFb.style.minWidth = '0'; gdriveBackupFb.style.margin = '0';
+      gdriveBackupFb.addEventListener('mouseenter', () => { gdriveBackupFb.style.filter = 'brightness(1.08)'; gdriveBackupFb.style.boxShadow = '0 6px 14px rgba(26,115,232,0.45)'; });
+      gdriveBackupFb.addEventListener('mouseleave', () => { gdriveBackupFb.style.filter = ''; gdriveBackupFb.style.boxShadow = '0 3px 8px rgba(26,115,232,0.35)'; });
+      gdriveBackupFb.addEventListener('click', function() {
+        if (typeof window.exportToGoogleDrive === 'function') { window.exportToGoogleDrive(); }
+        else { alert(t('gdriveExportUnavailable')); }
+      });
+
+      // Google Drive Restore Button (Fallback)
+      const gdriveRestoreFb = document.createElement('button');
+      gdriveRestoreFb.id = 'esm-gdrive-restore-btn';
+      gdriveRestoreFb.textContent = t('gdriveRestore');
+      gdriveRestoreFb.title = t('gdriveRestoreTitle');
+      gdriveRestoreFb.style.backgroundImage = 'linear-gradient(180deg, #34a853, #137333)';
+      gdriveRestoreFb.style.color = '#fff'; gdriveRestoreFb.style.border = 'none'; gdriveRestoreFb.style.borderRadius = '10px';
+      gdriveRestoreFb.style.padding = '8px 12px'; gdriveRestoreFb.style.fontWeight = '600'; gdriveRestoreFb.style.cursor = 'pointer';
+      gdriveRestoreFb.style.boxShadow = '0 3px 8px rgba(19, 115, 51, 0.35)';
+      gdriveRestoreFb.style.transition = 'transform 80ms ease, box-shadow 200ms ease, filter 200ms ease';
+      gdriveRestoreFb.style.whiteSpace = 'nowrap'; gdriveRestoreFb.style.display = 'inline-flex'; gdriveRestoreFb.style.alignItems = 'center';
+      gdriveRestoreFb.style.gap = '4px'; gdriveRestoreFb.style.fontSize = '13px'; gdriveRestoreFb.style.lineHeight = '18px';
+      gdriveRestoreFb.style.width = '100%'; gdriveRestoreFb.style.flex = '1 1 0'; gdriveRestoreFb.style.minWidth = '0'; gdriveRestoreFb.style.margin = '0';
+      gdriveRestoreFb.addEventListener('mouseenter', () => { gdriveRestoreFb.style.filter = 'brightness(1.08)'; gdriveRestoreFb.style.boxShadow = '0 6px 14px rgba(19,115,51,0.45)'; });
+      gdriveRestoreFb.addEventListener('mouseleave', () => { gdriveRestoreFb.style.filter = ''; gdriveRestoreFb.style.boxShadow = '0 3px 8px rgba(19,115,51,0.35)'; });
+      gdriveRestoreFb.addEventListener('click', function() {
+        if (typeof window.importFromGoogleDrive === 'function') { window.importFromGoogleDrive(); }
+        else { alert(t('gdriveImportUnavailable')); }
+      });
+
+      btnRow.appendChild(gdriveBackupFb);
+      btnRow.appendChild(gdriveRestoreFb);
+      panel.appendChild(btnRow);
+
+      // Auto Save UI im Fallback-Panel
+      try {
+        const autoSaveUI = createAutoSaveUI();
+        autoSaveUI.style.background = 'rgba(255,255,255,0.08)';
+        autoSaveUI.style.border = '1px solid rgba(255,255,255,0.15)';
+        autoSaveUI.style.color = '#eaeef5';
+        panel.appendChild(autoSaveUI);
+        loadAutoSaveSettings();
+      } catch (_) {}
+
+      const container = document.createElement('div');
+      container.id = 'key-list-container';
+      container.style.background = 'rgba(255,255,255,0.05)';
+      container.style.border = '1px solid rgba(255,255,255,0.10)';
+      container.style.borderRadius = '10px';
+      container.style.padding = '10px';
+      container.style.maxHeight = '320px';
+      container.style.overflow = 'auto';
+      panel.appendChild(container);
+
+      document.body.appendChild(panel);
+      window.uiMounted = true;
+      if (typeof window !== 'undefined' && window.ESM_DIAG) window.ESM_DIAG.log('UI mounted via floating fallback panel');
+    });
+  }
+
+  // Duplicate global addScriptTab removed; using the IIFE-scoped implementation exclusively.
+  // UI mounting is managed inside the IIFE via initialize(); removing duplicate global function to avoid scope issues.
+  if (typeof window !== 'undefined') {
+    if (typeof exportLocalStorage === 'function') {
+      window.exportLocalStorage = exportLocalStorage;
+    }
+    if (typeof importLocalStorage === 'function') {
+      window.importLocalStorage = importLocalStorage;
+    }
+    if (typeof exportToDropbox === 'function') {
+      window.exportToDropbox = exportToDropbox;
+    }
+    if (typeof importFromDropbox === 'function') {
+      window.importFromDropbox = importFromDropbox;
+    }
+    if (typeof exportToGoogleDrive === 'function') {
+      window.exportToGoogleDrive = exportToGoogleDrive;
+    }
+    if (typeof importFromGoogleDrive === 'function') {
+      window.importFromGoogleDrive = importFromGoogleDrive;
+    }
+  }
