@@ -1,17 +1,21 @@
 // ==UserScript==
 // @name         WME Easy Storage Manager
 // @namespace    https://greasyfork.org/en/scripts/466806-easy-storage-manager
-// @author       Hiwi234, DevlinDelFuego
-// @version      2026.04.04
+// @author       DevlinDelFuego, Hiwi234
+// @version      2026.04.13
 // @description  Easy Storage Manager is a handy script that allows you to easily export and import local storage data for WME.
 // @match        *://*.waze.com/*editor*
 // @exclude      *://*.waze.com/user/editor*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
 // @connect      api.dropboxapi.com
 // @connect      content.dropboxapi.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
 // @connect      accounts.google.com
+// @connect      esm-token-proxy.devlinlab.com
 // @require      https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
 // @license      GPLv3
 // @run-at      document-start
@@ -112,7 +116,7 @@
     const AUTO_SAVE_TARGET_KEY = 'ESM_AUTO_SAVE_TARGET';
     const AUTO_SAVE_MAX_BACKUPS_KEY = 'ESM_AUTO_SAVE_MAX_BACKUPS';
     let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : 'dev-local';
-    const updateMessage = "<b>Changelog</b><br><br> - Full backup export/import now includes localStorage, sessionStorage, cookies, and IndexedDB. <br> - You can select which items to restore across all storage types and DB records. <br> - The page will refresh after importing to apply changes. <br> - Added Dropbox cloud backup and restore functionality. <br> - Added Google Drive cloud backup and restore functionality. <br><br>";
+    const updateMessage = "<b>Changelog</b><br><br> - Added Dropbox cloud backup and restore functionality. <br> - Added Google Drive cloud backup and restore functionality. <br> - Improved backend security when connecting to cloud backup servers. <br><br>";
     const REAPPLY_STASH_KEY = 'ESM_POST_RELOAD';
     // Sprachunterstützung (DE/EN) für UI-Texte
     const ESM_LANG = ((navigator.language || 'en').toLowerCase().startsWith('de')) ? 'de' : 'en';
@@ -330,9 +334,7 @@
     // Dropbox API Configuration
     const DROPBOX_CONFIG = {
       APP_KEY: '9fxl4soww5di6qt',
-      APP_SECRET: '46inexcd3evrqik',
       ACCESS_TOKEN: null,
-      REDIRECT_URI: 'http://localhost:8080/esm_dropbox_oauth.html',
       // Use same-origin Waze Dropbox endpoint to satisfy CSP
       PROXY_BASE_URL: '/dropbox',
       API_BASE_URL: 'https://api.dropboxapi.com/2',
@@ -344,7 +346,24 @@
     const DROPBOX_ACCOUNT_CACHE_KEY = 'ESM_DROPBOX_ACCOUNT';
     const DROPBOX_REFRESH_TOKEN_KEY = 'ESM_DROPBOX_REFRESH_TOKEN';
     const DROPBOX_TOKEN_EXPIRES_KEY = 'ESM_DROPBOX_TOKEN_EXPIRES';
-const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
+
+    // Sandboxed storage for OAuth refresh tokens (GM_setValue when available, localStorage fallback).
+    // Access tokens use sessionStorage — cleared on tab close.
+    const gmStorage = {
+      get(key) {
+        try { if (typeof GM_getValue === 'function') return GM_getValue(key, null); } catch (_) {}
+        return localStorage.getItem(key);
+      },
+      set(key, value) {
+        try { if (typeof GM_setValue === 'function') { GM_setValue(key, value); return; } } catch (_) {}
+        localStorage.setItem(key, value);
+      },
+      remove(key) {
+        try { if (typeof GM_deleteValue === 'function') { GM_deleteValue(key); return; } } catch (_) {}
+        localStorage.removeItem(key);
+      }
+    };
+
 // Hook alerts to display bilingual messages for known keys
 (function(){
   const origAlert = window.alert;
@@ -361,15 +380,9 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
   };
 })();
 
-    function getRedirectUri() {
-      const saved = localStorage.getItem(DROPBOX_REDIRECT_URI_KEY);
-      if (saved && typeof saved === 'string' && saved.trim()) return saved.trim();
-      return DROPBOX_CONFIG.REDIRECT_URI;
-    }
-
     function setDropboxToken(token) {
       try {
-        localStorage.setItem(DROPBOX_TOKEN_KEY, token);
+        sessionStorage.setItem(DROPBOX_TOKEN_KEY, token);
         dropboxAuth = token;
         ESM_DIAG.log('Dropbox token gespeichert.');
       } catch (e) {
@@ -379,9 +392,9 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
 
     function clearDropboxToken() {
       try {
-        localStorage.removeItem(DROPBOX_TOKEN_KEY);
-        localStorage.removeItem(DROPBOX_REFRESH_TOKEN_KEY);
-        localStorage.removeItem(DROPBOX_TOKEN_EXPIRES_KEY);
+        sessionStorage.removeItem(DROPBOX_TOKEN_KEY);
+        sessionStorage.removeItem(DROPBOX_TOKEN_EXPIRES_KEY);
+        gmStorage.remove(DROPBOX_REFRESH_TOKEN_KEY);
         dropboxAuth = null;
         sessionStorage.removeItem(DROPBOX_ACCOUNT_CACHE_KEY);
         ESM_DIAG.log('Dropbox-Token gelöscht.');
@@ -426,25 +439,6 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       return info;
     }
 
-    // Helfer global verfügbar machen
-    try {
-      window.ESM_setDropboxToken = setDropboxToken;
-      window.ESM_clearDropboxToken = clearDropboxToken;
-      window.ESM_promptDropboxToken = promptForDropboxToken;
-      window.ESM_setDropboxRedirectUri = function (url) {
-        try {
-          if (typeof url !== 'string' || !url.trim()) throw new Error('Ungültige URL');
-          const u = url.trim();
-          localStorage.setItem(DROPBOX_REDIRECT_URI_KEY, u);
-          DROPBOX_CONFIG.REDIRECT_URI = u; // live update
-          ESM_DIAG.log('Dropbox Redirect-URI gesetzt:', u);
-        } catch (e) {
-          ESM_DIAG.error('Konnte Redirect-URI nicht setzen:', e);
-        }
-      };
-      window.ESM_getDropboxRedirectUri = function () { return getRedirectUri(); };
-    } catch (_) {}
-
     // ===== OAuth 2.0 (PKCE) Hilfsfunktionen =====
     function base64urlFromBytes(bytes) {
       let bin = '';
@@ -461,125 +455,6 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       const hash = await crypto.subtle.digest('SHA-256', data);
       return base64urlFromBytes(new Uint8Array(hash));
     }
-    function saveTokenResponse(token) {
-      try {
-        if (token.access_token) localStorage.setItem(DROPBOX_TOKEN_KEY, token.access_token);
-        if (token.refresh_token) localStorage.setItem(DROPBOX_REFRESH_TOKEN_KEY, token.refresh_token);
-        const expiresAt = token.expires_in ? (Date.now() + (token.expires_in * 1000)) : 0;
-        localStorage.setItem(DROPBOX_TOKEN_EXPIRES_KEY, String(expiresAt));
-        dropboxAuth = token.access_token || null;
-      } catch (e) {
-        ESM_DIAG.warn('Konnte Token-Antwort nicht speichern:', e);
-      }
-    }
-    async function exchangeCodeForToken(code, verifier) {
-      const body = new URLSearchParams({
-        code,
-        grant_type: 'authorization_code',
-        client_id: DROPBOX_CONFIG.APP_KEY,
-        code_verifier: verifier,
-        redirect_uri: getRedirectUri()
-      }).toString();
-      const res = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL.replace('/2','')}/oauth2/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body
-      });
-      if (res.status < 200 || res.status >= 300) {
-        throw new Error(`Token-Austausch fehlgeschlagen (${res.status}): ${res.responseText || ''}`);
-      }
-      let json; try { json = JSON.parse(res.responseText); } catch (_) { json = {}; }
-      saveTokenResponse(json);
-      return json;
-    }
-    async function refreshAccessToken() {
-      const refreshToken = localStorage.getItem(DROPBOX_REFRESH_TOKEN_KEY);
-      if (!refreshToken) throw new Error('Kein Refresh-Token vorhanden');
-      const body = new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: DROPBOX_CONFIG.APP_KEY
-      }).toString();
-      const res = await gmFetch(`${DROPBOX_CONFIG.API_BASE_URL.replace('/2','')}/oauth2/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body
-      });
-      if (res.status < 200 || res.status >= 300) {
-        throw new Error(`Token-Refresh fehlgeschlagen (${res.status}): ${res.responseText || ''}`);
-      }
-      let json; try { json = JSON.parse(res.responseText); } catch (_) { json = {}; }
-      saveTokenResponse(json);
-      return json;
-    }
-    async function ensureDropboxAccessToken() {
-      const token = localStorage.getItem(DROPBOX_TOKEN_KEY);
-      const exp = parseInt(localStorage.getItem(DROPBOX_TOKEN_EXPIRES_KEY) || '0', 10);
-      if (token && exp && (Date.now() < (exp - 60_000))) {
-        dropboxAuth = token;
-        return token;
-      }
-      if (localStorage.getItem(DROPBOX_REFRESH_TOKEN_KEY)) {
-        const refreshed = await refreshAccessToken();
-        return refreshed.access_token;
-      }
-      return null;
-    }
-    async function oauthDropboxPKCE() {
-      const verifier = generateCodeVerifier();
-      const challenge = await sha256Base64Url(verifier);
-      const state = Math.random().toString(36).slice(2);
-      try { sessionStorage.setItem('ESM_OAUTH_VERIFIER', verifier); sessionStorage.setItem('ESM_OAUTH_STATE', state); } catch (_) {}
-      const redirectUri = getRedirectUri();
-      // Warnung ausgeben, falls die Redirect-URI offensichtlich nicht produktionsfähig ist
-      try {
-        const u = new URL(redirectUri);
-        if (u.protocol !== 'https:' && u.hostname !== 'localhost') {
-          ESM_DIAG.warn('Redirect-URI ist nicht HTTPS. Dropbox verlangt im Live-Betrieb HTTPS.');
-        }
-      } catch (e) {
-        ESM_DIAG.warn('Ungültige Redirect-URI-Konfiguration:', redirectUri);
-      }
-      const params = new URLSearchParams({
-        response_type: 'code',
-        client_id: DROPBOX_CONFIG.APP_KEY,
-        redirect_uri: redirectUri,
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
-        token_access_type: 'offline',
-        state
-      }).toString();
-      const authUrl = `https://www.dropbox.com/oauth2/authorize?${params}`;
-      const w = window.open(authUrl, 'esm_dropbox_oauth', 'width=600,height=700');
-      if (!w) throw new Error('Konnte OAuth-Fenster nicht öffnen');
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          window.removeEventListener('message', onMsg);
-          reject(new Error('OAuth Zeitüberschreitung'));
-        }, 180_000);
-        function onMsg(e) {
-          try {
-            const data = e.data || {};
-            if (data && data.type === 'ESM_DROPBOX_OAUTH_CODE') {
-              window.removeEventListener('message', onMsg);
-              clearTimeout(timer);
-              const ver = sessionStorage.getItem('ESM_OAUTH_VERIFIER') || verifier;
-              const st = sessionStorage.getItem('ESM_OAUTH_STATE');
-              if (st && data.state && st !== data.state) {
-                reject(new Error('Ungültiger OAuth state'));
-                return;
-              }
-              exchangeCodeForToken(data.code, ver).then(resolve).catch(reject);
-            }
-          } catch (err) {
-            // ignore
-          }
-        }
-        window.addEventListener('message', onMsg);
-      });
-    }
-    try { window.ESM_startDropboxOAuth = oauthDropboxPKCE; } catch (_) {}
-
     // Wrapper around GM_xmlhttpRequest to bypass page CSP when available
     function gmFetch(url, opts = {}) {
       const method = opts.method || 'GET';
@@ -646,10 +521,6 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       }
     }
     const NativeStorage = captureNativeStorage();
-
-    // Early recovery attempt immediately after script start,
-    // so that protected keys are activated before other user scripts, if possible
-    try { reapplyAfterReload(); } catch (_) { /* ignore */ }
 
     // ===== Einfache Anleitung & Token-Input (UI) für Dropbox Cloud =====
     // parent: optional Container; wenn gesetzt, wird das Panel inline im Skripte-Tab gerendert
@@ -721,24 +592,95 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         const content = document.createElement('div');
         content.style.padding = '12px';
         content.style.display = hidden ? 'none' : 'block';
-        content.innerHTML = `
-          <div style="font-size:12px; line-height:1.5;">
-            <p style="margin:0 0 8px"><b>${t('howTo')}</b></p>
-            <ol style="margin:0 0 10px 18px; padding:0;">
-              <li>${t('step1')}</li>
-              <li>${t('step2')} <a href="https://www.dropbox.com/developers/apps" target="_blank" rel="noopener">https://www.dropbox.com/developers/apps</a></li>
-              <li>${t('step3')}</li>
-              <li>${t('step4')}</li>
-            </ol>
-            <div style="margin:8px 0 4px">${t('genTokenLabel')}</div>
-            <input id="esm-dropbox-token-input" type="text" placeholder="Dropbox Access Token" style="width:100%; box-sizing:border-box; font-size:12px; padding:6px 8px; border:1px solid #d1d5db; border-radius:8px;" />
-            <div style="display:flex; gap:8px; margin-top:8px;">
-              <button id="esm-dropbox-token-save" style="flex:1; font-size:12px; border:1px solid #10b981; background:#10b981; color:#fff; border-radius:8px; padding:6px 8px; cursor:pointer;">${t('saveTokenBtn')}</button>
-              <button id="esm-dropbox-token-clear" style="flex:1; font-size:12px; border:1px solid #ef4444; background:#ef4444; color:#fff; border-radius:8px; padding:6px 8px; cursor:pointer;">${t('clearTokenBtn')}</button>
-            </div>
-            <div id="esm-dropbox-token-status" style="margin-top:8px; font-size:12px; color:#374151;"></div>
-          </div>
-        `;
+        const inner = document.createElement('div');
+        inner.style.fontSize = '12px';
+        inner.style.lineHeight = '1.5';
+
+        const howToP = document.createElement('p');
+        howToP.style.margin = '0 0 8px';
+        const howToBold = document.createElement('b');
+        howToBold.textContent = t('howTo');
+        howToP.appendChild(howToBold);
+        inner.appendChild(howToP);
+
+        const ol = document.createElement('ol');
+        ol.style.margin = '0 0 10px 18px';
+        ol.style.padding = '0';
+        const steps = [t('step1'), null, t('step3'), t('step4')];
+        steps.forEach((stepText, i) => {
+          const li = document.createElement('li');
+          if (i === 1) {
+            li.textContent = t('step2') + ' ';
+            const a = document.createElement('a');
+            a.href = 'https://www.dropbox.com/developers/apps';
+            a.target = '_blank';
+            a.rel = 'noopener';
+            a.textContent = 'https://www.dropbox.com/developers/apps';
+            li.appendChild(a);
+          } else {
+            li.textContent = stepText;
+          }
+          ol.appendChild(li);
+        });
+        inner.appendChild(ol);
+
+        const tokenLabel = document.createElement('div');
+        tokenLabel.style.margin = '8px 0 4px';
+        tokenLabel.textContent = t('genTokenLabel');
+        inner.appendChild(tokenLabel);
+
+        const input = document.createElement('input');
+        input.id = 'esm-dropbox-token-input';
+        input.type = 'text';
+        input.placeholder = 'Dropbox Access Token';
+        input.style.width = '100%';
+        input.style.boxSizing = 'border-box';
+        input.style.fontSize = '12px';
+        input.style.padding = '6px 8px';
+        input.style.border = '1px solid #d1d5db';
+        input.style.borderRadius = '8px';
+        inner.appendChild(input);
+
+        const btnRow = document.createElement('div');
+        btnRow.style.display = 'flex';
+        btnRow.style.gap = '8px';
+        btnRow.style.marginTop = '8px';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.id = 'esm-dropbox-token-save';
+        saveBtn.textContent = t('saveTokenBtn');
+        saveBtn.style.flex = '1';
+        saveBtn.style.fontSize = '12px';
+        saveBtn.style.border = '1px solid #10b981';
+        saveBtn.style.background = '#10b981';
+        saveBtn.style.color = '#fff';
+        saveBtn.style.borderRadius = '8px';
+        saveBtn.style.padding = '6px 8px';
+        saveBtn.style.cursor = 'pointer';
+        btnRow.appendChild(saveBtn);
+
+        const clearBtn = document.createElement('button');
+        clearBtn.id = 'esm-dropbox-token-clear';
+        clearBtn.textContent = t('clearTokenBtn');
+        clearBtn.style.flex = '1';
+        clearBtn.style.fontSize = '12px';
+        clearBtn.style.border = '1px solid #ef4444';
+        clearBtn.style.background = '#ef4444';
+        clearBtn.style.color = '#fff';
+        clearBtn.style.borderRadius = '8px';
+        clearBtn.style.padding = '6px 8px';
+        clearBtn.style.cursor = 'pointer';
+        btnRow.appendChild(clearBtn);
+        inner.appendChild(btnRow);
+
+        const statusEl = document.createElement('div');
+        statusEl.id = 'esm-dropbox-token-status';
+        statusEl.style.marginTop = '8px';
+        statusEl.style.fontSize = '12px';
+        statusEl.style.color = '#374151';
+        inner.appendChild(statusEl);
+
+        content.appendChild(inner);
 
         card.appendChild(header);
         card.appendChild(content);
@@ -748,14 +690,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         } else {
           document.documentElement.appendChild(wrapper);
         }
-
-        // Prefill input with stored token if available
-        const input = content.querySelector('#esm-dropbox-token-input');
-        const saveBtn = content.querySelector('#esm-dropbox-token-save');
-        const clearBtn = content.querySelector('#esm-dropbox-token-clear');
-        const statusEl = content.querySelector('#esm-dropbox-token-status');
         try {
-          const stored = localStorage.getItem(DROPBOX_TOKEN_KEY);
+          const stored = sessionStorage.getItem(DROPBOX_TOKEN_KEY);
           if (stored) input.value = stored;
         } catch (_) {}
 
@@ -797,7 +733,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       try {
         ESM_DIAG.log('Dropbox-Authentifizierung (nur Token) starten...');
         // Direkt gespeicherten Token verwenden
-        const token = (dropboxAuth && String(dropboxAuth).trim()) || localStorage.getItem(DROPBOX_TOKEN_KEY);
+        const token = (dropboxAuth && String(dropboxAuth).trim()) || sessionStorage.getItem(DROPBOX_TOKEN_KEY);
         if (token && String(token).trim()) {
           try { await getDropboxAccount(token); } catch (_) {}
           dropboxAuth = String(token).trim();
@@ -818,10 +754,14 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       try {
         const cookies = document.cookie.split(';').map(s => s.trim()).reduce((acc, cur) => {
           const idx = cur.indexOf('=');
-          if (idx > -1) acc[cur.slice(0, idx)] = decodeURIComponent(cur.slice(idx + 1));
+          if (idx > -1) {
+            try { acc[cur.slice(0, idx)] = decodeURIComponent(cur.slice(idx + 1)); } catch (_) {}
+          }
           return acc;
         }, {});
-        const token = cookies['XSRF-TOKEN'] || cookies['xsrf-token'] || cookies['_csrf'] || cookies['csrf'] || cookies['csrf_token'] || cookies['X-CSRF-TOKEN'];
+        const rawToken = cookies['XSRF-TOKEN'] || cookies['xsrf-token'] || cookies['_csrf'] || cookies['csrf'] || cookies['csrf_token'] || cookies['X-CSRF-TOKEN'];
+        // Validate token contains only safe characters before putting it in headers
+        const token = (rawToken && /^[a-zA-Z0-9\-_.~+/=]{8,}$/.test(rawToken)) ? rawToken : null;
         if (!token) {
           ESM_DIAG.warn('No CSRF token cookie found for waze.com Dropbox endpoint');
           return {};
@@ -841,7 +781,19 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
 
 
     // Export backup to Dropbox
+    const COOKIE_WARNING_KEY = 'ESM_COOKIE_WARNING_SHOWN';
+    function warnCookiesOnce() {
+      try { if (sessionStorage.getItem(COOKIE_WARNING_KEY)) return true; } catch (_) {}
+      const msg = ESM_LANG === 'de'
+        ? 'Dieses Backup enthält Cookies (inkl. Sitzungs- und Authentifizierungs-Cookies).\n\nBewahre die Datei sicher auf – wer sie besitzt, kann deine Sitzung übernehmen.\n\nFortfahren?'
+        : 'This backup includes cookies (including session and authentication cookies).\n\nKeep the file secure — anyone who has it can replay your session.\n\nProceed?';
+      const ok = confirm(msg);
+      if (ok) { try { sessionStorage.setItem(COOKIE_WARNING_KEY, '1'); } catch (_) {} }
+      return ok;
+    }
+
     async function exportToDropbox() {
+      if (!warnCookiesOnce()) return;
       try {
         ESM_DIAG.log('Starting Dropbox backup...');
 
@@ -981,7 +933,6 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
     }
 
     // Import backup from Dropbox
-    // Import backup from Dropbox
     async function importFromDropbox() {
       try {
         ESM_DIAG.log('Starting Dropbox restore...');
@@ -1064,7 +1015,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         const selection = prompt(`${fileList}${t('restorePrompt')} (1-${files.length})`);
         if (!selection) return;
 
-        const fileIndex = parseInt(selection) - 1;
+        const fileIndex = parseInt(selection, 10) - 1;
         if (fileIndex < 0 || fileIndex >= files.length) {
           alert(t('invalidSelection'));
           return;
@@ -1150,7 +1101,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
                   const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
                   if (!storeName || !Array.isArray(storeBackup.entries)) continue;
                   for (const entry of storeBackup.entries) {
-                    const keyStr = JSON.stringify(entry.key);
+                    let keyStr;
+                    try { keyStr = JSON.stringify(entry.key); } catch (e) { ESM_DIAG.warn('Skipping IDB entry with non-serializable key:', e); continue; }
                     const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
                     const valueObj = {
                       db: dbName,
@@ -1192,28 +1144,29 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
 
     // ===== Google Drive API Configuration & Functions =====
     const GDRIVE_CONFIG = {
-      // WICHTIG: Eigene OAuth Client ID hier eintragen!
-      // Erstelle unter https://console.cloud.google.com/apis/credentials eine OAuth 2.0 Client-ID (Web-App).
-      // Authorized JavaScript Origins: https://www.waze.com
-      // Authorized Redirect URI: https://www.waze.com/oauth2callback
-      CLIENT_ID: '190557226782-nousklt3lu6lkse9umfsurqhcqhr30vs.apps.googleusercontent.com',
-      SCOPES: 'https://www.googleapis.com/auth/drive.appdata',
+      // OAuth Client ID (public — visible in redirect URLs anyway)
+      // Create at https://console.cloud.google.com/apis/credentials
+      //   Type: Web application
+      //   Authorized JavaScript Origins: https://www.waze.com
+      //   Authorized Redirect URI: https://www.waze.com/oauth2callback
+      CLIENT_ID: '43613994100-ku10bn3ajmnfs1p7162mahraq402q6j7.apps.googleusercontent.com',
+      // CLIENT_SECRET is NOT stored here — it lives in the Cloudflare Worker (token-proxy/).
+      // Set TOKEN_PROXY_URL to your deployed worker URL.
+      TOKEN_PROXY_URL: 'https://esm-token-proxy.devlinlab.com',
+      SCOPES: 'https://www.googleapis.com/auth/drive.file',
       UPLOAD_URL: 'https://www.googleapis.com/upload/drive/v3/files',
       FILES_URL: 'https://www.googleapis.com/drive/v3/files'
     };
     const GDRIVE_TOKEN_KEY = 'ESM_GDRIVE_TOKEN';
     const GDRIVE_TOKEN_EXPIRES_KEY = 'ESM_GDRIVE_TOKEN_EXPIRES';
     const GDRIVE_TOKEN_SCOPE_KEY = 'ESM_GDRIVE_TOKEN_SCOPE';
-    let gdriveAuth = null;
-
+    const GDRIVE_REFRESH_TOKEN_KEY = 'ESM_GDRIVE_REFRESH_TOKEN';
     function loadGdriveToken() {
       try {
-        const token = localStorage.getItem(GDRIVE_TOKEN_KEY);
-        const exp = parseInt(localStorage.getItem(GDRIVE_TOKEN_EXPIRES_KEY) || '0', 10);
-        const savedScope = localStorage.getItem(GDRIVE_TOKEN_SCOPE_KEY) || '';
-        // Token ungültig wenn abgelaufen oder Scope geändert
-        if (token && exp && Date.now() < (exp - 60000) && savedScope === GDRIVE_CONFIG.SCOPES) { gdriveAuth = token; return token; }
-        // Alten Token löschen wenn Scope nicht passt
+        const token = sessionStorage.getItem(GDRIVE_TOKEN_KEY);
+        const exp = parseInt(sessionStorage.getItem(GDRIVE_TOKEN_EXPIRES_KEY) || '0', 10);
+        const savedScope = sessionStorage.getItem(GDRIVE_TOKEN_SCOPE_KEY) || '';
+        if (token && exp && Date.now() < (exp - 60000) && savedScope === GDRIVE_CONFIG.SCOPES) { return token; }
         if (savedScope && savedScope !== GDRIVE_CONFIG.SCOPES) {
           ESM_DIAG.log('Google Drive Scope geändert, alter Token wird gelöscht.');
           clearGdriveToken();
@@ -1222,87 +1175,173 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       return null;
     }
 
-    function saveGdriveToken(token, expiresIn) {
+    function saveGdriveToken(token, expiresIn, refreshToken) {
       try {
-        localStorage.setItem(GDRIVE_TOKEN_KEY, token);
+        sessionStorage.setItem(GDRIVE_TOKEN_KEY, token);
         const expiresAt = expiresIn ? (Date.now() + (expiresIn * 1000)) : (Date.now() + 3600000);
-        localStorage.setItem(GDRIVE_TOKEN_EXPIRES_KEY, String(expiresAt));
-        localStorage.setItem(GDRIVE_TOKEN_SCOPE_KEY, GDRIVE_CONFIG.SCOPES);
-        gdriveAuth = token;
+        sessionStorage.setItem(GDRIVE_TOKEN_EXPIRES_KEY, String(expiresAt));
+        sessionStorage.setItem(GDRIVE_TOKEN_SCOPE_KEY, GDRIVE_CONFIG.SCOPES);
+        if (refreshToken) gmStorage.set(GDRIVE_REFRESH_TOKEN_KEY, refreshToken);
         ESM_DIAG.log('Google Drive Token gespeichert.');
       } catch (e) { ESM_DIAG.warn('Konnte Google Drive Token nicht speichern:', e); }
     }
 
     function clearGdriveToken() {
       try {
-        localStorage.removeItem(GDRIVE_TOKEN_KEY);
-        localStorage.removeItem(GDRIVE_TOKEN_EXPIRES_KEY);
-        localStorage.removeItem(GDRIVE_TOKEN_SCOPE_KEY);
-        gdriveAuth = null;
+        sessionStorage.removeItem(GDRIVE_TOKEN_KEY);
+        sessionStorage.removeItem(GDRIVE_TOKEN_EXPIRES_KEY);
+        sessionStorage.removeItem(GDRIVE_TOKEN_SCOPE_KEY);
+        gmStorage.remove(GDRIVE_REFRESH_TOKEN_KEY);
+        gdriveFolderIdCache = null;
         ESM_DIAG.log('Google Drive Token gelöscht.');
       } catch (e) { ESM_DIAG.warn('Konnte Google Drive Token nicht löschen:', e); }
     }
 
-    // OAuth 2.0 Implicit Flow via Popup – User sieht nur den Google Login Screen
-    function oauthGoogleImplicit() {
-      return new Promise((resolve, reject) => {
-        const state = Math.random().toString(36).slice(2);
-        try { sessionStorage.setItem('ESM_GOOGLE_OAUTH_STATE', state); } catch (_) {}
+    async function refreshGdriveToken() {
+      const refreshToken = gmStorage.get(GDRIVE_REFRESH_TOKEN_KEY);
+      if (!refreshToken) throw new Error('No Google refresh token available');
+      const res = await gmFetch(`${GDRIVE_CONFIG.TOKEN_PROXY_URL}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+        body: JSON.stringify({ refresh_token: refreshToken })
+      });
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error(`Google token refresh failed (${res.status}): ${res.responseText || ''}`);
+      }
+      const json = JSON.parse(res.responseText);
+      if (!json.access_token || typeof json.access_token !== 'string') {
+        throw new Error('Google token refresh returned no access_token');
+      }
+      // Refresh response does not include a new refresh_token — keep the existing one
+      saveGdriveToken(json.access_token, json.expires_in);
+      return json.access_token;
+    }
 
-        const redirectUri = location.origin + '/oauth2callback';
-        const params = new URLSearchParams({
-          client_id: GDRIVE_CONFIG.CLIENT_ID,
-          redirect_uri: redirectUri,
-          response_type: 'token',
-          scope: GDRIVE_CONFIG.SCOPES,
-          state: state,
-          include_granted_scopes: 'true',
-          prompt: 'consent'
-        }).toString();
-
-        const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-        const popup = window.open(authUrl, 'esm_google_oauth', 'width=500,height=600');
-        if (!popup) { reject(new Error(ESM_LANG === 'de' ? 'Popup blockiert – bitte Popup-Blocker deaktivieren' : 'Popup blocked – please disable popup blocker')); return; }
-
-        const timer = setTimeout(() => { clearInterval(pollInterval); reject(new Error('Google OAuth timeout (3 min)')); }, 180000);
-
-        const pollInterval = setInterval(() => {
+    // OAuth 2.0 Authorization Code + PKCE via Popup
+    function oauthGooglePKCE() {
+      return new Promise(async (resolve, reject) => {
+        try {
+          const verifier = generateCodeVerifier();
+          const challenge = await sha256Base64Url(verifier);
+          const state = base64urlFromBytes(crypto.getRandomValues(new Uint8Array(32)));
           try {
-            if (!popup || popup.closed) { clearInterval(pollInterval); clearTimeout(timer); reject(new Error(ESM_LANG === 'de' ? 'OAuth-Fenster wurde geschlossen' : 'OAuth window was closed')); return; }
-            const popupUrl = popup.location.href;
-            if (popupUrl && popupUrl.startsWith(location.origin)) {
-              clearInterval(pollInterval); clearTimeout(timer); popup.close();
-              const hash = popupUrl.split('#')[1] || '';
-              const fragParams = new URLSearchParams(hash);
-              const accessToken = fragParams.get('access_token');
-              const expiresIn = parseInt(fragParams.get('expires_in') || '3600', 10);
-              const returnedState = fragParams.get('state');
-              const error = fragParams.get('error');
-              if (error) { reject(new Error(`Google OAuth: ${error}`)); return; }
-              const savedState = sessionStorage.getItem('ESM_GOOGLE_OAUTH_STATE');
-              if (savedState && returnedState && savedState !== returnedState) { reject(new Error('Invalid OAuth state')); return; }
-              if (!accessToken) { reject(new Error('No access token in response')); return; }
-              saveGdriveToken(accessToken, expiresIn);
-              resolve(accessToken);
-            }
-          } catch (e) { /* cross-origin – popup still on Google, keep polling */ }
-        }, 500);
+            sessionStorage.setItem('ESM_GOOGLE_OAUTH_STATE', state);
+            sessionStorage.setItem('ESM_GOOGLE_OAUTH_VERIFIER', verifier);
+          } catch (_) {}
+
+          const redirectUri = location.origin + '/oauth2callback';
+          const params = new URLSearchParams({
+            client_id: GDRIVE_CONFIG.CLIENT_ID,
+            redirect_uri: redirectUri,
+            response_type: 'code',
+            scope: GDRIVE_CONFIG.SCOPES,
+            state,
+            code_challenge: challenge,
+            code_challenge_method: 'S256',
+            access_type: 'offline',
+            prompt: 'consent'
+          }).toString();
+
+          const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+          const popup = window.open(authUrl, 'esm_google_oauth', 'width=500,height=600');
+          if (!popup) { reject(new Error(ESM_LANG === 'de' ? 'Popup blockiert – bitte Popup-Blocker deaktivieren' : 'Popup blocked – please disable popup blocker')); return; }
+
+          const timer = setTimeout(() => { clearInterval(pollInterval); reject(new Error('Google OAuth timeout (3 min)')); }, 180000);
+
+          const pollInterval = setInterval(async () => {
+            try {
+              if (!popup || popup.closed) { clearInterval(pollInterval); clearTimeout(timer); reject(new Error(ESM_LANG === 'de' ? 'OAuth-Fenster wurde geschlossen' : 'OAuth window was closed')); return; }
+              const popupUrl = popup.location.href;
+              if (popupUrl && popupUrl.startsWith(location.origin)) {
+                clearInterval(pollInterval); clearTimeout(timer); popup.close();
+                const urlObj = new URL(popupUrl);
+                const code = urlObj.searchParams.get('code');
+                const returnedState = urlObj.searchParams.get('state');
+                const error = urlObj.searchParams.get('error');
+                if (error) { reject(new Error(`Google OAuth: ${error}`)); return; }
+                const savedState = sessionStorage.getItem('ESM_GOOGLE_OAUTH_STATE');
+                if (!savedState || !returnedState || savedState !== returnedState) { reject(new Error('Invalid OAuth state')); return; }
+                if (!code) { reject(new Error('No authorization code in response')); return; }
+                // Exchange code for tokens
+                const ver = sessionStorage.getItem('ESM_GOOGLE_OAUTH_VERIFIER') || verifier;
+                try {
+                  const tokenRes = await gmFetch(`${GDRIVE_CONFIG.TOKEN_PROXY_URL}/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Origin': location.origin },
+                    body: JSON.stringify({
+                      code,
+                      code_verifier: ver,
+                      redirect_uri: redirectUri
+                    })
+                  });
+                  if (tokenRes.status < 200 || tokenRes.status >= 300) {
+                    reject(new Error(`Token exchange failed (${tokenRes.status}): ${tokenRes.responseText || ''}`)); return;
+                  }
+                  const json = JSON.parse(tokenRes.responseText);
+                  if (!json.access_token || typeof json.access_token !== 'string') {
+                    reject(new Error('Token exchange returned no access_token')); return;
+                  }
+                  saveGdriveToken(json.access_token, json.expires_in, json.refresh_token);
+                  resolve(json.access_token);
+                } catch (err) { reject(err); }
+              }
+            } catch (e) { /* cross-origin – popup still on Google, keep polling */ }
+          }, 500);
+        } catch (err) { reject(err); }
       });
     }
 
     async function authenticateGdrive() {
+      // 1. Valid cached access token
       const existing = loadGdriveToken();
       if (existing) return existing;
-      return await oauthGoogleImplicit();
+      // 2. Refresh token available — get a new access token silently
+      if (gmStorage.get(GDRIVE_REFRESH_TOKEN_KEY)) {
+        try { return await refreshGdriveToken(); } catch (e) {
+          ESM_DIAG.warn('Google token refresh failed, falling back to login:', e);
+          clearGdriveToken();
+        }
+      }
+      // 3. Full PKCE login flow
+      return await oauthGooglePKCE();
     }
 
-    // Find or create the WME_Backups folder in Google Drive
-    // Mit drive.appdata nutzen wir den versteckten appDataFolder – kein Ordner erstellen nötig.
-    // Google Drive stellt automatisch einen privaten App-Ordner bereit.
-    const GDRIVE_APP_FOLDER = 'appDataFolder';
+    // Find or create the WME_Backups folder in Google Drive (visible in Drive UI)
+    const GDRIVE_FOLDER_NAME = 'WME_Backups';
+    let gdriveFolderIdCache = null;
+
+    async function getOrCreateGdriveFolder(accessToken) {
+      if (gdriveFolderIdCache) return gdriveFolderIdCache;
+      // Search for existing folder
+      const searchUrl = `${GDRIVE_CONFIG.FILES_URL}?q=${encodeURIComponent(`name='${GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`)}&fields=files(id,name)&spaces=drive`;
+      const searchRes = await gmFetch(searchUrl, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+      });
+      if (searchRes.status >= 200 && searchRes.status < 300) {
+        const data = JSON.parse(searchRes.responseText);
+        if (data.files && data.files.length > 0) {
+          gdriveFolderIdCache = data.files[0].id;
+          return gdriveFolderIdCache;
+        }
+      }
+      // Create the folder
+      const createRes = await gmFetch(GDRIVE_CONFIG.FILES_URL, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: GDRIVE_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' })
+      });
+      if (createRes.status < 200 || createRes.status >= 300) {
+        throw new Error(`Failed to create WME_Backups folder: ${createRes.status}`);
+      }
+      const folder = JSON.parse(createRes.responseText);
+      gdriveFolderIdCache = folder.id;
+      return gdriveFolderIdCache;
+    }
 
     // Export backup to Google Drive
     async function exportToGoogleDrive() {
+      if (!warnCookiesOnce()) return;
       try {
         ESM_DIAG.log('Starting Google Drive backup...');
         if (typeof GM_xmlhttpRequest !== 'function') {
@@ -1353,8 +1392,9 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         const fileName = `wme_settings_backup_${timestamp}.json`;
 
         // Multipart upload to Google Drive
-        const boundary = '===ESM_GDRIVE_BOUNDARY===';
-        const metadata = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+        const folderId = await getOrCreateGdriveFolder(accessToken);
+        const boundary = 'ESM' + Array.from(crypto.getRandomValues(new Uint8Array(12))).map(b => b.toString(16).padStart(2, '0')).join('');
+        const metadata = JSON.stringify({ name: fileName, parents: [folderId], mimeType: 'application/json' });
         const multipartBody =
           `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
           `--${boundary}\r\nContent-Type: application/json\r\n\r\n${backupData}\r\n` +
@@ -1392,8 +1432,9 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         }
         const accessToken = await authenticateGdrive();
 
-        // List backup files in appDataFolder
-        const listUrl = `${GDRIVE_CONFIG.FILES_URL}?spaces=appDataFolder&q=${encodeURIComponent("name contains 'wme_settings_backup'")}&fields=files(id,name,size,modifiedTime)&orderBy=modifiedTime%20desc`;
+        // List backup files in WME_Backups folder
+        const folderId = await getOrCreateGdriveFolder(accessToken);
+        const listUrl = `${GDRIVE_CONFIG.FILES_URL}?spaces=drive&q=${encodeURIComponent(`'${folderId}' in parents and name contains 'wme_settings_backup' and trashed=false`)}&fields=files(id,name,size,modifiedTime)&orderBy=modifiedTime%20desc`;
         ESM_DIAG.log('Google Drive list URL:', listUrl);
         const listRes = await gmFetch(listUrl, {
           method: 'GET',
@@ -1422,7 +1463,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         const selection = prompt(`${fileList}${t('restorePrompt')} (1-${files.length})`);
         if (!selection) return;
 
-        const fileIndex = parseInt(selection) - 1;
+        const fileIndex = parseInt(selection, 10) - 1;
         if (fileIndex < 0 || fileIndex >= files.length) {
           alert(t('invalidSelection'));
           return;
@@ -1468,7 +1509,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
                   const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
                   if (!storeName || !Array.isArray(storeBackup.entries)) continue;
                   for (const entry of storeBackup.entries) {
-                    const keyStr = JSON.stringify(entry.key);
+                    let keyStr;
+                    try { keyStr = JSON.stringify(entry.key); } catch (e) { ESM_DIAG.warn('Skipping IDB entry with non-serializable key:', e); continue; }
                     const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
                     keyValuePairs.push([keyLabel, { db: dbName, store: storeName, key: entry.key, value: entry.value, keyPath: storeBackup.keyPath || null, autoIncrement: !!storeBackup.autoIncrement, indexes: Array.isArray(storeBackup.indexes) ? storeBackup.indexes : [] }]);
                   }
@@ -1554,7 +1596,23 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         loginBtn.addEventListener('mouseenter', () => { loginBtn.style.background = '#f8f9fa'; loginBtn.style.boxShadow = '0 2px 6px rgba(0,0,0,0.12)'; });
         loginBtn.addEventListener('mouseleave', () => { loginBtn.style.background = '#fff'; loginBtn.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; });
         const gLogo = document.createElement('span');
-        gLogo.innerHTML = '<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>';
+        (function() {
+          const NS = 'http://www.w3.org/2000/svg';
+          const svg = document.createElementNS(NS, 'svg');
+          svg.setAttribute('width', '18'); svg.setAttribute('height', '18'); svg.setAttribute('viewBox', '0 0 48 48');
+          const paths = [
+            ['#EA4335', 'M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z'],
+            ['#4285F4', 'M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z'],
+            ['#FBBC05', 'M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z'],
+            ['#34A853', 'M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z']
+          ];
+          paths.forEach(([fill, d]) => {
+            const p = document.createElementNS(NS, 'path');
+            p.setAttribute('fill', fill); p.setAttribute('d', d);
+            svg.appendChild(p);
+          });
+          gLogo.appendChild(svg);
+        })();
         loginBtn.appendChild(gLogo);
         const loginText = document.createElement('span');
         loginBtn.appendChild(loginText);
@@ -1587,7 +1645,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
           try {
             statusEl.textContent = ESM_LANG === 'de' ? 'Anmeldung läuft...' : 'Signing in...';
             statusEl.style.color = '#374151';
-            await oauthGoogleImplicit();
+            await oauthGooglePKCE();
             updateGdriveUI();
           } catch (e) {
             statusEl.textContent = `${ESM_LANG === 'de' ? 'Fehler' : 'Error'}: ${e.message}`;
@@ -1609,12 +1667,6 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
         ESM_DIAG.warn('Konnte Google Drive Hilfspanel nicht einfügen:', e);
       }
     }
-
-    // Export helpers to window
-    try {
-      window.ESM_clearGdriveToken = clearGdriveToken;
-      window.ESM_startGoogleOAuth = oauthGoogleImplicit;
-    } catch (_) {}
 
     // Export local storage data to a JSON file
     async function backupIndexedDB() {
@@ -1801,8 +1853,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
 
     function getAutoSaveMaxBackups() {
       try {
-        var v = parseInt(localStorage.getItem(AUTO_SAVE_MAX_BACKUPS_KEY) || '1');
-        return (v >= 1 && v <= 10) ? v : 1;
+        var v = parseInt(localStorage.getItem(AUTO_SAVE_MAX_BACKUPS_KEY) || '1', 10);
+        return (!isNaN(v) && v >= 1 && v <= 10) ? v : 1;
       } catch (_) { return 1; }
     }
 
@@ -1835,7 +1887,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
     // Google Drive: alte Auto-Save Backups auflisten und älteste löschen
     async function cleanupOldGdriveBackups(accessToken, maxBackups) {
       try {
-        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=appDataFolder&q=' + encodeURIComponent("name contains 'wme_autosave_'") + '&fields=files(id,name,modifiedTime)&orderBy=modifiedTime%20asc';
+        var folderId = await getOrCreateGdriveFolder(accessToken);
+        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=drive&q=' + encodeURIComponent("'" + folderId + "' in parents and name contains 'wme_autosave_' and trashed=false") + '&fields=files(id,name,modifiedTime)&orderBy=modifiedTime%20asc';
         var listRes = await gmFetch(listUrl, {
           method: 'GET',
           headers: { 'Authorization': 'Bearer ' + accessToken }
@@ -1939,7 +1992,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       var fileName;
       if (maxBackups <= 1) {
         // Bei Überschreiben: bestehende Datei suchen und updaten
-        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=appDataFolder&q=' + encodeURIComponent("name = 'wme_autosave_latest.json'") + '&fields=files(id,name)';
+        var folderId = await getOrCreateGdriveFolder(accessToken);
+        var listUrl = GDRIVE_CONFIG.FILES_URL + '?spaces=drive&q=' + encodeURIComponent("'" + folderId + "' in parents and name = 'wme_autosave_latest.json' and trashed=false") + '&fields=files(id,name)';
         var listRes = await gmFetch(listUrl, { method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken } });
         var existingId = null;
         if (listRes.status >= 200 && listRes.status < 300) {
@@ -1957,8 +2011,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
           if (updateRes.status < 200 || updateRes.status >= 300) throw new Error('GDrive update failed: ' + updateRes.status);
         } else {
           fileName = 'wme_autosave_latest.json';
-          var boundary = '===ESM_AUTOSAVE===';
-          var metadata = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+          var boundary = 'ESM' + Array.from(crypto.getRandomValues(new Uint8Array(12))).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+          var metadata = JSON.stringify({ name: fileName, parents: [folderId], mimeType: 'application/json' });
           var multipartBody = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + metadata + '\r\n--' + boundary + '\r\nContent-Type: application/json\r\n\r\n' + backupData + '\r\n--' + boundary + '--';
           var uploadRes = await gmFetch(GDRIVE_CONFIG.UPLOAD_URL + '?uploadType=multipart', {
             method: 'POST',
@@ -1970,8 +2024,9 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       } else {
         var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         fileName = 'wme_autosave_' + timestamp + '.json';
-        var boundary2 = '===ESM_AUTOSAVE===';
-        var metadata2 = JSON.stringify({ name: fileName, parents: [GDRIVE_APP_FOLDER], mimeType: 'application/json' });
+        var boundary2 = 'ESM' + Array.from(crypto.getRandomValues(new Uint8Array(12))).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+        var folderId2 = await getOrCreateGdriveFolder(accessToken);
+        var metadata2 = JSON.stringify({ name: fileName, parents: [folderId2], mimeType: 'application/json' });
         var multipartBody2 = '--' + boundary2 + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + metadata2 + '\r\n--' + boundary2 + '\r\nContent-Type: application/json\r\n\r\n' + backupData + '\r\n--' + boundary2 + '--';
         var uploadRes2 = await gmFetch(GDRIVE_CONFIG.UPLOAD_URL + '?uploadType=multipart', {
           method: 'POST',
@@ -2189,6 +2244,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
     }
 
     async function exportLocalStorage() {
+      if (!warnCookiesOnce()) return;
       const backup = {
         meta: {
           exportedAt: new Date().toISOString(),
@@ -2289,7 +2345,8 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
                     const storeName = (storeBackup && storeBackup.name) ? storeBackup.name : undefined;
                     if (!storeName || !Array.isArray(storeBackup.entries)) continue;
                     for (const entry of storeBackup.entries) {
-                      const keyStr = JSON.stringify(entry.key);
+                      let keyStr;
+                      try { keyStr = JSON.stringify(entry.key); } catch (e) { ESM_DIAG.warn('Skipping IDB entry with non-serializable key:', e); continue; }
                       const keyLabel = `indexedDB:${dbName}/${storeName}:${keyStr}`;
                       const valueObj = {
                         db: dbName,
@@ -2396,6 +2453,7 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
       }
 
       const { counts, failures } = await applyPairs(selectedPairs);
+      importedData = null; // Clear sensitive backup data from memory after apply
 
       const summary = `Import Completed\n- localStorage: ${counts.local}\n- sessionStorage: ${counts.session}\n- Cookies: ${counts.cookie}\n- IndexedDB: ${counts.idb}` + (failures.length ? `\n\nError (first ${Math.min(5, failures.length)}):\n${failures.slice(0,5).join('\n')}${failures.length > 5 ? `\n... (${failures.length - 5} more)` : ''}` : '');
       alert(summary);
@@ -2438,6 +2496,12 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
     }
 
     // Helper to apply selected pairs across storage types and IndexedDB (inside IIFE)
+    const KEY_MAX_LEN = 512;
+    const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+    function isValidStorageKey(key) {
+      return typeof key === 'string' && key.length > 0 && key.length <= KEY_MAX_LEN && !DANGEROUS_KEYS.has(key);
+    }
+
     async function applyPairs(selectedPairs) {
       const counts = { local: 0, session: 0, cookie: 0, idb: 0 };
       const failures = [];
@@ -2449,12 +2513,23 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
           const colonIdx = fullKey.indexOf(':');
           if (colonIdx < 0) {
             // Fallback: without type prefix we treat it as localStorage
+            if (!isValidStorageKey(fullKey)) {
+              failures.push(`${fullKey} skipped (invalid key)`);
+              ESM_DIAG.warn('Skipping invalid key:', fullKey);
+              continue;
+            }
             localStorage.setItem(fullKey, value);
             counts.local++;
             continue;
           }
           const type = fullKey.slice(0, colonIdx);
           const rest = fullKey.slice(colonIdx + 1);
+
+          if (type !== 'indexedDB' && !isValidStorageKey(rest)) {
+            failures.push(`${fullKey} skipped (invalid key)`);
+            ESM_DIAG.warn('Skipping invalid key:', fullKey);
+            continue;
+          }
 
           if (type === 'localStorage') {
             try {
@@ -2478,8 +2553,16 @@ const DROPBOX_REDIRECT_URI_KEY = 'ESM_DROPBOX_REDIRECT_URI';
             if (!sameOrigin) {
               failures.push(`cookie:${rest} skipped (Origin differs)`);
             } else {
-              // Set a session cookie (root path). An expiration date can be added if necessary.
-              document.cookie = `${rest}=${value}; path=/`;
+              // Sanitize the cookie name and validate it contains only legal cookie-name chars.
+              const safeCookieName = String(rest).split(';')[0].trim();
+              if (!safeCookieName || !/^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/.test(safeCookieName)) {
+                failures.push(`cookie:${rest} skipped (invalid cookie name characters)`);
+                ESM_DIAG.warn('Skipping cookie with invalid name:', rest);
+                continue;
+              }
+              const safeCookieValue = encodeURIComponent(String(value));
+              const secureFlag = location.protocol === 'https:' ? '; Secure' : '';
+              document.cookie = `${safeCookieName}=${safeCookieValue}; path=/; SameSite=Strict${secureFlag}`;
               counts.cookie++;
             }
           } else if (type === 'indexedDB') {
@@ -3023,13 +3106,8 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
       };
 
       const originalSetItem = localStorage.setItem.bind(localStorage);
-      const originalGetItem = localStorage.getItem.bind(localStorage);
       const originalRemoveItem = localStorage.removeItem.bind(localStorage);
       const originalClear = localStorage.clear.bind(localStorage);
-      const originalProtoSetItem = Storage.prototype.setItem;
-      const originalProtoGetItem = Storage.prototype.getItem;
-      const originalProtoRemoveItem = Storage.prototype.removeItem;
-      const originalProtoClear = Storage.prototype.clear;
       const protectMs = 120000; // 120s protection
       const protectUntil = Date.now() + protectMs;
       const protectedKeys = new Set(Array.from(desiredLocal.keys()));
@@ -3047,7 +3125,7 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
           if (protectedKeys.has(key) && Date.now() < protectUntil) {
             const desired = desiredLocal.get(key);
             ESM_DIAG.log('Protected getItem intercepted for key:', key);
-            return typeof desired === 'string' ? desired : desired;
+            return desired != null ? String(desired) : null;
           }
           return NativeStorage.getItem.call(window.localStorage, key);
         };
@@ -3077,52 +3155,6 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
           return originalClear();
         };
 
-        Storage.prototype.setItem = function (key, value) {
-          const isLocal = this === window.localStorage || this === localStorage;
-          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
-            ESM_DIAG.log('Prototype setItem intercepted for key:', key);
-            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (e) { return; }
-          }
-          return originalProtoSetItem.call(this, key, value);
-        };
-
-        Storage.prototype.getItem = function (key) {
-          const isLocal = this === window.localStorage || this === localStorage;
-          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
-            const desired = desiredLocal.get(key);
-            ESM_DIAG.log('Prototype getItem intercepted for key:', key);
-            return typeof desired === 'string' ? desired : desired;
-          }
-          return originalProtoGetItem.call(this, key);
-        };
-
-        Storage.prototype.removeItem = function (key) {
-          const isLocal = this === window.localStorage || this === localStorage;
-          if (isLocal && protectedKeys.has(key) && Date.now() < protectUntil) {
-            ESM_DIAG.log('Prototype removeItem blocked for key:', key);
-            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (_) { return; }
-          }
-          return originalProtoRemoveItem.call(this, key);
-        };
-
-        Storage.prototype.clear = function () {
-          const isLocal = this === window.localStorage || this === localStorage;
-          if (isLocal && Date.now() < protectUntil && protectedKeys.size) {
-            ESM_DIAG.log('Prototype clear intercepted; preserving keys:', Array.from(protectedKeys));
-            try {
-              const len = window.localStorage.length;
-              const toRemove = [];
-              for (let i = 0; i < len; i++) {
-                const k = NativeStorage.key.call(window.localStorage, i);
-                if (k != null && !protectedKeys.has(k)) toRemove.push(k);
-              }
-              toRemove.forEach(k => { try { originalRemoveItem(k); } catch (_) {} });
-              return;
-            } catch (_) { /* fallback */ }
-          }
-          return originalProtoClear.call(this);
-        };
-
         ESM_DIAG.log('Protection overrides applied for keys:', Array.from(protectedKeys), 'until', new Date(protectUntil).toISOString());
       } catch (ex) {
         ESM_DIAG.error('Error applying protection overrides:', ex);
@@ -3142,13 +3174,14 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
     window.importFromGoogleDrive = importFromGoogleDrive;
   }
 
-  // Properly close IIFE
-  })();
-
-  // Duplicate reapplyAfterReload removed; the IIFE version is used.
-
   async function writeIndexedDBRecord(record) {
     return new Promise((resolve, reject) => {
+      if (typeof record.db !== 'string' || record.db.length === 0 || record.db.length > 255) {
+        reject(new Error(`Invalid IndexedDB name: ${record.db}`)); return;
+      }
+      if (typeof record.store !== 'string' || record.store.length === 0 || record.store.length > 255) {
+        reject(new Error(`Invalid store name: ${record.store}`)); return;
+      }
       const openReq = indexedDB.open(record.db);
       openReq.onerror = () => reject(openReq.error);
       openReq.onupgradeneeded = () => { /* no-op */ };
@@ -3215,6 +3248,9 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
       };
     });
   }
+
+  // Properly close IIFE
+  })();
 
   // Duplicate applyPairs removed; using the in-IIFE implementation.
   let uiMounted = false;
