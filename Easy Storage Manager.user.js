@@ -2,7 +2,7 @@
 // @name         WME Easy Storage Manager
 // @namespace    https://greasyfork.org/en/scripts/466806-easy-storage-manager
 // @author       DevlinDelFuego, Hiwi234
-// @version      2026.04.13
+// @version      2026.04.20
 // @description  Easy Storage Manager is a handy script that allows you to easily export and import local storage data for WME.
 // @match        *://*.waze.com/*editor*
 // @exclude      *://*.waze.com/user/editor*
@@ -29,11 +29,25 @@
     warn: (...args) => console.warn('[ESM]', ...args),
     error: (...args) => console.error('[ESM]', ...args)
   };
+  const ESM_SCRIPT_ID = 'easy-storage-manager';
+  // Capture this script's own URL at load time so we can filter out errors from other scripts.
+  const ESM_SCRIPT_URL = (() => {
+    try {
+      throw new Error();
+    } catch (e) {
+      const m = e.stack && e.stack.match(/userscript\.html\?[^\s):]+/i);
+      return m ? m[0].toLowerCase() : '';
+    }
+  })();
   window.addEventListener('error', (e) => {
+    const src = (e.filename || '').toLowerCase();
+    if (!src.includes(ESM_SCRIPT_ID) && !(ESM_SCRIPT_URL && src.includes(ESM_SCRIPT_URL))) return;
     try { sessionStorage.setItem('ESM_DIAG_LAST_ERROR', `${e.message} at ${e.filename}:${e.lineno}`); } catch (err) {}
     ESM_DIAG.error('Unhandled error:', e.message);
   });
   window.addEventListener('unhandledrejection', (e) => {
+    const stack = (e.reason && e.reason.stack) ? e.reason.stack.toLowerCase() : '';
+    if (stack && !stack.includes(ESM_SCRIPT_ID) && !(ESM_SCRIPT_URL && stack.includes(ESM_SCRIPT_URL))) return;
     try { sessionStorage.setItem('ESM_DIAG_LAST_REJECTION', String(e.reason)); } catch (err) {}
     ESM_DIAG.error('Unhandled rejection:', e.reason);
   });
@@ -116,7 +130,7 @@
     const AUTO_SAVE_TARGET_KEY = 'ESM_AUTO_SAVE_TARGET';
     const AUTO_SAVE_MAX_BACKUPS_KEY = 'ESM_AUTO_SAVE_MAX_BACKUPS';
     let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : 'dev-local';
-    const updateMessage = "<b>Changelog</b><br><br> - Added Dropbox cloud backup and restore functionality. <br> - Added Google Drive cloud backup and restore functionality. <br> - Improved backend security when connecting to cloud backup servers. <br><br>";
+    const updateMessage = "<b>Changelog</b><br><br> - Bug fixes. <br><br>";
     const REAPPLY_STASH_KEY = 'ESM_POST_RELOAD';
     // Sprachunterstützung (DE/EN) für UI-Texte
     const ESM_LANG = ((navigator.language || 'en').toLowerCase().startsWith('de')) ? 'de' : 'en';
@@ -499,7 +513,6 @@
       try {
         const iframe = document.createElement('iframe');
         iframe.style.display = 'none';
-        iframe.src = 'about:blank';
         document.documentElement.appendChild(iframe);
         const win = iframe.contentWindow;
         const methods = {
@@ -2389,7 +2402,7 @@
     // Display the list of keys for selection
     function displayKeyList(keyValuePairs) {
       const container = document.getElementById('key-list-container');
-      container.innerHTML = ''; // Clear existing list
+      container.replaceChildren(); // Clear existing list
 
       // Select All button
       const selectAllButton = document.createElement('button');
@@ -3062,6 +3075,10 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
       ESM_DIAG.log('Parsed stash items count:', Array.isArray(stash.items) ? stash.items.length : 0);
       if (!(stash && stash.origin === location.origin && Array.isArray(stash.items) && stash.items.length)) { ESM_DIAG.warn('Stash invalid or empty; skipping.'); return; }
 
+      // Apply the stash immediately, then do two lightweight repair passes in case
+      // WME resets keys during its own initialization. No localStorage prototype patching —
+      // that caused other userscripts to receive wrong values or have their writes silently
+      // overwritten during the 2-minute protection window.
       applyPairs(stash.items).then(({ counts, failures }) => {
         ESM_DIAG.log('Initial applyPairs after reload complete.', counts, failures.slice(0, 3));
         const summary = `Restored after reload executed.\n- localStorage: ${counts.local}\n- sessionStorage: ${counts.session}\n- Cookies: ${counts.cookie}\n- IndexedDB: ${counts.idb}` + (failures.length ? `\n\nError (first ${Math.min(5, failures.length)}):\n${failures.slice(0,5).join('\n')}${failures.length > 5 ? `\n... (${failures.length - 5} more)` : ''}` : '');
@@ -3079,88 +3096,28 @@ if (cloudRestoreBtn) { cloudRestoreBtn.textContent = t('cloudRestore'); cloudRes
       }
       ESM_DIAG.log('Desired localStorage keys:', Array.from(desiredLocal.keys()));
 
-      const scheduleRepairs = (delaysMs) => {
-        ESM_DIAG.log('Scheduling repairs with delays:', delaysMs);
-        delaysMs.forEach(ms => {
-          setTimeout(() => {
-            const repairs = [];
-            desiredLocal.forEach((desired, name) => {
-              try {
-                const current = NativeStorage.getItem.call(window.localStorage, name);
-                if (current !== desired) {
-                  ESM_DIAG.log('Repair needed for key:', name, 'current=', current, 'desired=', desired);
-                  repairs.push([`localStorage:${name}`, desired]);
-                } else {
-                  ESM_DIAG.log('Key already correct:', name);
-                }
-              } catch (e) {
-                ESM_DIAG.warn('Error reading key during repair check:', name, e);
-              }
-            });
-            if (repairs.length) {
-              ESM_DIAG.log('Applying repairs count:', repairs.length);
-              applyPairs(repairs).catch((ex) => { ESM_DIAG.error('applyPairs repairs failed:', ex); });
-            }
-          }, ms);
-        });
-      };
-
-      const originalSetItem = localStorage.setItem.bind(localStorage);
-      const originalRemoveItem = localStorage.removeItem.bind(localStorage);
-      const originalClear = localStorage.clear.bind(localStorage);
-      const protectMs = 120000; // 120s protection
-      const protectUntil = Date.now() + protectMs;
-      const protectedKeys = new Set(Array.from(desiredLocal.keys()));
-
-      try {
-        localStorage.setItem = function (key, value) {
-          if (protectedKeys.has(key) && Date.now() < protectUntil) {
-            ESM_DIAG.log('Protected setItem intercepted for key:', key);
-            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (e) { return; }
-          }
-          return originalSetItem(key, value);
-        };
-
-        localStorage.getItem = function (key) {
-          if (protectedKeys.has(key) && Date.now() < protectUntil) {
-            const desired = desiredLocal.get(key);
-            ESM_DIAG.log('Protected getItem intercepted for key:', key);
-            return desired != null ? String(desired) : null;
-          }
-          return NativeStorage.getItem.call(window.localStorage, key);
-        };
-
-        localStorage.removeItem = function (key) {
-          if (protectedKeys.has(key) && Date.now() < protectUntil) {
-            ESM_DIAG.log('Protected removeItem blocked for key:', key);
-            try { return NativeStorage.setItem.call(window.localStorage, key, desiredLocal.get(key)); } catch (_) { return; }
-          }
-          return originalRemoveItem(key);
-        };
-
-        localStorage.clear = function () {
-          if (Date.now() < protectUntil && protectedKeys.size) {
-            ESM_DIAG.log('Protected clear intercepted; preserving keys:', Array.from(protectedKeys));
+      // Two repair passes: 500ms and 3s after apply — enough to catch WME's init reset
+      // without staying active long enough to interfere with other scripts.
+      [500, 3000].forEach(ms => {
+        setTimeout(() => {
+          const repairs = [];
+          desiredLocal.forEach((desired, name) => {
             try {
-              const len = window.localStorage.length;
-              const toRemove = [];
-              for (let i = 0; i < len; i++) {
-                const k = NativeStorage.key.call(window.localStorage, i);
-                if (k != null && !protectedKeys.has(k)) toRemove.push(k);
+              const current = NativeStorage.getItem.call(window.localStorage, name);
+              if (current !== desired) {
+                ESM_DIAG.log('Repair needed for key:', name);
+                repairs.push([`localStorage:${name}`, desired]);
               }
-              toRemove.forEach(k => { try { originalRemoveItem(k); } catch (_) {} });
-              return;
-            } catch (_) { /* fallback */ }
+            } catch (e) {
+              ESM_DIAG.warn('Error reading key during repair check:', name, e);
+            }
+          });
+          if (repairs.length) {
+            ESM_DIAG.log('Applying repairs count:', repairs.length);
+            applyPairs(repairs).catch((ex) => { ESM_DIAG.error('applyPairs repairs failed:', ex); });
           }
-          return originalClear();
-        };
-
-        ESM_DIAG.log('Protection overrides applied for keys:', Array.from(protectedKeys), 'until', new Date(protectUntil).toISOString());
-      } catch (ex) {
-        ESM_DIAG.error('Error applying protection overrides:', ex);
-      }
-
-      scheduleRepairs([500, 2000, 5000, 10000, 20000, 30000, 45000, 60000, 90000, 120000]);
+        }, ms);
+      });
     } catch (ex) {
       ESM_DIAG.error('Error parsing stash or scheduling repairs:', ex);
     }
