@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         WME Easy Storage Manager
 // @namespace    https://greasyfork.org/en/scripts/466806-easy-storage-manager
-// @author       DevlinDelFuego, Hiwi234
-// @version      2026.04.20
+// @author       DevlinDelFuego, Hiwi234, DeviateFromThePlan
+// @version      2026.09.23
 // @description  Easy Storage Manager is a handy script that allows you to easily export and import local storage data for WME.
 // @match        *://*.waze.com/*editor*
+// @match        https://www.waze.com/oauth2callback*
 // @exclude      *://*.waze.com/user/editor*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -23,6 +24,15 @@
 
 (function () {
     'use strict';
+
+  // Google OAuth return page. The redirect URI is always https://www.waze.com/oauth2callback (the one
+  // registered with Google), so when ESM runs on beta.waze.com the WME tab can't read this popup's
+  // URL (cross-origin). Hand the result over through script storage, which both origins share.
+  if (location.hostname === 'www.waze.com' && location.pathname.startsWith('/oauth2callback')) {
+    try { GM_setValue('ESM_GOOGLE_OAUTH_RESULT', JSON.stringify({ url: location.href, at: Date.now() })); } catch (_) {}
+    setTimeout(() => window.close(), 300);
+    return;
+  }
 
   const ESM_DIAG = {
     log: (...args) => console.log('[ESM]', ...args),
@@ -130,7 +140,7 @@
     const AUTO_SAVE_TARGET_KEY = 'ESM_AUTO_SAVE_TARGET';
     const AUTO_SAVE_MAX_BACKUPS_KEY = 'ESM_AUTO_SAVE_MAX_BACKUPS';
     let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : 'dev-local';
-    const updateMessage = "<b>Changelog</b><br><br> - Bug fixes. <br><br>";
+    const updateMessage = "<b>Changelog</b><br><br> - Google Drive sign-in now works on beta WME (fixes Error 400: redirect_uri_mismatch). - DeviateFromThePlan <br><br>";
     const REAPPLY_STASH_KEY = 'ESM_POST_RELOAD';
     // Sprachunterstützung (DE/EN) für UI-Texte
     const ESM_LANG = ((navigator.language || 'en').toLowerCase().startsWith('de')) ? 'de' : 'en';
@@ -1166,6 +1176,8 @@
       // CLIENT_SECRET is NOT stored here — it lives in the Cloudflare Worker (token-proxy/).
       // Set TOKEN_PROXY_URL to your deployed worker URL.
       TOKEN_PROXY_URL: 'https://esm-token-proxy.devlinlab.com',
+      // Must match the Authorized Redirect URI exactly, on www and beta alike.
+      REDIRECT_URI: 'https://www.waze.com/oauth2callback',
       SCOPES: 'https://www.googleapis.com/auth/drive.file',
       UPLOAD_URL: 'https://www.googleapis.com/upload/drive/v3/files',
       FILES_URL: 'https://www.googleapis.com/drive/v3/files'
@@ -1242,7 +1254,10 @@
             sessionStorage.setItem('ESM_GOOGLE_OAUTH_VERIFIER', verifier);
           } catch (_) {}
 
-          const redirectUri = location.origin + '/oauth2callback';
+          const redirectUri = GDRIVE_CONFIG.REDIRECT_URI;
+          const startedAt = Date.now();
+          let closedAt = 0;
+          gmStorage.remove('ESM_GOOGLE_OAUTH_RESULT');
           const params = new URLSearchParams({
             client_id: GDRIVE_CONFIG.CLIENT_ID,
             redirect_uri: redirectUri,
@@ -1263,10 +1278,26 @@
 
           const pollInterval = setInterval(async () => {
             try {
-              if (!popup || popup.closed) { clearInterval(pollInterval); clearTimeout(timer); reject(new Error(ESM_LANG === 'de' ? 'OAuth-Fenster wurde geschlossen' : 'OAuth window was closed')); return; }
-              const popupUrl = popup.location.href;
-              if (popupUrl && popupUrl.startsWith(location.origin)) {
-                clearInterval(pollInterval); clearTimeout(timer); popup.close();
+              // The return page (see top of script) stores its URL; this works from www and beta.
+              let popupUrl = null;
+              try {
+                const handoff = JSON.parse(gmStorage.get('ESM_GOOGLE_OAUTH_RESULT') || 'null');
+                if (handoff && handoff.at >= startedAt) popupUrl = handoff.url;
+              } catch (_) {}
+              if (!popupUrl) {
+                if (!popup || popup.closed) {
+                  // The return page closes itself right after storing the result, and storage can take a
+                  // moment to reach this tab, so wait briefly before treating it as cancelled.
+                  closedAt = closedAt || Date.now();
+                  if (Date.now() - closedAt < 2000) return;
+                  clearInterval(pollInterval); clearTimeout(timer); reject(new Error(ESM_LANG === 'de' ? 'OAuth-Fenster wurde geschlossen' : 'OAuth window was closed')); return;
+                }
+                const href = popup.location.href; // throws while the popup is still on Google
+                if (href && href.startsWith(new URL(redirectUri).origin)) popupUrl = href;
+              }
+              if (popupUrl) {
+                clearInterval(pollInterval); clearTimeout(timer); gmStorage.remove('ESM_GOOGLE_OAUTH_RESULT');
+                try { popup.close(); } catch (_) {}
                 const urlObj = new URL(popupUrl);
                 const code = urlObj.searchParams.get('code');
                 const returnedState = urlObj.searchParams.get('state');
