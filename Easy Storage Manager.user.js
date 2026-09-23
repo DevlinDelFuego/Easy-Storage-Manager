@@ -140,7 +140,7 @@
     const AUTO_SAVE_TARGET_KEY = 'ESM_AUTO_SAVE_TARGET';
     const AUTO_SAVE_MAX_BACKUPS_KEY = 'ESM_AUTO_SAVE_MAX_BACKUPS';
     let scriptVersion = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) ? GM_info.script.version : 'dev-local';
-    const updateMessage = "<b>Changelog</b><br><br> - Google Drive sign-in now works on beta WME (fixes Error 400: redirect_uri_mismatch). - DeviateFromThePlan <br><br>";
+    const updateMessage = "<b>Changelog</b><br><br> - Google Drive sign-in now works on beta WME (fixes Error 400: redirect_uri_mismatch).<br> - Thanks to DeviateFromThePlan for the fix. <br><br>";
     const REAPPLY_STASH_KEY = 'ESM_POST_RELOAD';
     // Sprachunterstützung (DE/EN) für UI-Texte
     const ESM_LANG = ((navigator.language || 'en').toLowerCase().startsWith('de')) ? 'de' : 'en';
